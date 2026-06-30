@@ -100,17 +100,34 @@ function stripContentSecurityPolicy() {
   });
 }
 
-// Electron isn't ready to create windows until the "ready" event fires.
-app.whenReady().then(() => {
-  stripContentSecurityPolicy();
-  createWindow();
-
-  // On macOS, apps usually stay open with no windows; re-create one when the
-  // dock icon is clicked and there are none. (Harmless on Windows.)
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+// Allow only ONE instance at a time. Running several at once makes them fight
+// over the same cache folder (the "disk_cache: Access is denied" errors), which
+// can corrupt the session and log you out. A second launch just focuses the
+// existing window instead.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const [win] = BrowserWindow.getAllWindows();
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
+    }
   });
-});
+
+  // Electron isn't ready to create windows until the "ready" event fires.
+  app.whenReady().then(() => {
+    stripContentSecurityPolicy();
+    createWindow();
+
+    // On macOS, apps usually stay open with no windows; re-create one when the
+    // dock icon is clicked and there are none. (Harmless on Windows.)
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  });
+}
 
 // On Windows/Linux, quit the app once every window is closed.
 app.on("window-all-closed", () => {

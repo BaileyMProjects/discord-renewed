@@ -55,48 +55,58 @@ function renderBackground() {
   const dim = `rgba(0, 0, 0, ${dimOpacity})`;
 
   style.textContent = `
-    /* Override Discord's surface-colour variables so panels that use them go
-       see-through automatically (covers both old and new theme tokens). */
-    :root, .theme-dark, .theme-darker, .theme-midnight, .theme-light {
-      --background-primary: transparent !important;
-      --background-secondary: transparent !important;
-      --background-secondary-alt: transparent !important;
-      --background-tertiary: transparent !important;
-      --background-base-low: transparent !important;
-      --background-base-lower: transparent !important;
-      --background-base-lowest: transparent !important;
-      --bg-overlay-app-frame: transparent !important;
-      --bg-base-primary: transparent !important;
-      --bg-base-secondary: transparent !important;
-      --bg-base-tertiary: transparent !important;
-      --background-floating: transparent !important;
-      --background-surface-high: transparent !important;
-      --background-surface-higher: transparent !important;
-      --background-surface-highest: transparent !important;
-      --profile-body-background-color: transparent !important;
-    }
-
-    /* Paint the dimmed image on the root elements. */
-    html, body, #app-mount {
+    /* Paint the dimmed image on the full-window base layers. bg__ is the actual
+       full-screen backdrop (sits above app__/appMount), so painting it gives one
+       continuous wallpaper without per-panel tiling or fixed attachment. */
+    html, body,
+    [class*="appMount__"],
+    [class*="app__"],
+    [class*="bg__"] {
       background-image: linear-gradient(${dim}, ${dim}), url("${currentImageUrl}") !important;
       background-size: cover !important;
       background-position: center !important;
       background-repeat: no-repeat !important;
-      background-attachment: fixed !important;
     }
 
-    /* Transparent-ize the main layout layers by class as a backstop. */
-    [class*="baseLayer"],
-    [class*="app_"],
-    [class*="base_"],
-    [class*="content_"],
+    /* Clear the opaque region fills so the wallpaper shows behind them. These
+       are the main-app panels (server rail, channel/DM list, chat, member list,
+       friends page, message box). Content (avatars, banners, text) sits on top
+       and stays visible. */
+    aside,
+    [class*="guilds__"],
     [class*="container_"],
-    [class*="sidebar_"],
+    [class*="privateChannels_"],
     [class*="chat_"],
     [class*="chatContent_"],
-    [class*="bg_"],
-    [class*="appAsidePanelWrapper"] {
+    [class*="scrollableContainer"],
+    [class*="scroller_"],
+    [class*="tabBody__"],
+    [class*="nowPlayingColumn__"],
+    [class*="itemCard"],
+    [class*="member"],
+    [class*="outerContainer_"],
+    [class*="modalContent_"] {
       background-color: transparent !important;
+    }
+
+    /* The bottom-left user bar and the message text box stay transparent but get
+       a subtle outline so they still read as distinct bars. */
+    [class*="panels_"],
+    [class*="channelTextArea_"] {
+      background-color: transparent !important;
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      border-radius: 8px !important;
+    }
+
+    /* Settings: keep the PANELS (sidebar + content) normal/opaque, but leave the
+       area AROUND them transparent (so it shows the wallpaper, not a grey block).
+       Scoped under …outerContainer_ so the main-app sidebar/content aren't hit.
+       The descendant selectors out-specify the transparency rules above. */
+    [class*="outerContainer_"] [class*="sidebar_"] {
+      background-color: #2b2d31 !important;
+    }
+    [class*="outerContainer_"] [class*="content_"] {
+      background-color: #313338 !important;
     }
   `;
 }
