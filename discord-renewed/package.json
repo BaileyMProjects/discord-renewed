@@ -1,21 +1,15 @@
 {
   "name": "discord-renewed",
-  "private": true,
   "version": "0.1.0",
-  "type": "module",
+  "description": "A custom Discord desktop client with built-in, settings-driven customization.",
+  "author": "Bailey Montoya",
+  "license": "MIT",
+  "private": true,
+  "main": "main.js",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
-    "preview": "vite preview",
-    "tauri": "tauri"
-  },
-  "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "start": "electron ."
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2",
-    "vite": "^6.0.3",
-    "typescript": "~5.6.2"
+    "electron": "^43.0.0"
   }
 }
