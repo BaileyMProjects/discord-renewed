@@ -36,6 +36,18 @@ function setDimOpacity(value) {
 function removeBackground() {
   currentImageUrl = null;
   renderBackground();
+  ipcRenderer.invoke("dr:remove-background");
+}
+
+// Load saved settings (background + dimming) and apply them. Called on startup
+// so nothing resets between launches.
+function loadSavedSettings() {
+  ipcRenderer.invoke("dr:get-settings").then((s) => {
+    if (!s) return;
+    if (typeof s.dim === "number") dimOpacity = s.dim;
+    if (s.image) currentImageUrl = s.image;
+    renderBackground();
+  });
 }
 
 function renderBackground() {
@@ -262,6 +274,10 @@ function showPage() {
     setDimOpacity(Number(slider.value) / 100);
     sliderLabel.textContent = `Background dimming — ${pct()}`;
   });
+  // Persist once the user releases the slider (avoids saving on every pixel).
+  slider.addEventListener("change", () => {
+    ipcRenderer.invoke("dr:set-dim", dimOpacity);
+  });
 
   const sliderHint = document.createElement("p");
   sliderHint.textContent = "Higher dimming makes text easier to read over the image.";
@@ -361,5 +377,6 @@ const observer = new MutationObserver(() => injectSettings());
 window.addEventListener("DOMContentLoaded", () => {
   observer.observe(document.documentElement, { childList: true, subtree: true });
   injectSettings();
+  loadSavedSettings();
   log("preload ready");
 });

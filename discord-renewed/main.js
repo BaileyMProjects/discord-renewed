@@ -56,31 +56,108 @@ const IMAGE_MIME = {
   bmp: "image/bmp",
 };
 
-// When the preload script asks (via ipcRenderer.invoke), open the native
-// "choose a file" dialog so the user can pick a background image. Native
-// dialogs can only be opened from the main process, which is why this lives
-// here.
-//
-// A page loaded from https://discord.com is not allowed to reference local
-// file:// images, so instead we read the file ourselves and return it as a
-// "data URL" (the image encoded directly into the string). The page can use
-// that as a CSS background with no local-file restrictions.
+// ---------------------------------------------------------------------------
+// Persistent settings
+// ---------------------------------------------------------------------------
+// Everything the user customizes is saved to a JSON file in the app's data
+// folder, so nothing resets when the app is closed. Background images are
+// COPIED into that folder (so the original file can move/delete freely) and the
+// settings file just records the copy's name + other preferences like dimming.
+
+function settingsDir() {
+  return app.getPath("userData");
+}
+function settingsFile() {
+  return path.join(settingsDir(), "settings.json");
+}
+
+function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(settingsFile(), "utf8"));
+  } catch {
+    return {}; // no file yet, or unreadable → start fresh
+  }
+}
+
+function writeSettings(settings) {
+  try {
+    fs.writeFileSync(settingsFile(), JSON.stringify(settings, null, 2));
+  } catch (err) {
+    console.error("[DiscordRenewed] failed to save settings:", err);
+  }
+}
+
+// Read the saved background image (if any) back as a data URL the page can use.
+function backgroundDataUrl(settings) {
+  if (!settings.backgroundFile) return null;
+  try {
+    const p = path.join(settingsDir(), settings.backgroundFile);
+    const ext = path.extname(p).slice(1).toLowerCase();
+    const mime = IMAGE_MIME[ext] || "application/octet-stream";
+    return `data:${mime};base64,${fs.readFileSync(p).toString("base64")}`;
+  } catch {
+    return null; // file went missing
+  }
+}
+
+// On startup the preload asks for the saved settings so it can re-apply them.
+ipcMain.handle("dr:get-settings", () => {
+  const s = readSettings();
+  return {
+    image: backgroundDataUrl(s),
+    dim: typeof s.dim === "number" ? s.dim : 0.5,
+  };
+});
+
+// Open the native file picker, COPY the chosen image into the app data folder,
+// record it, and return it as a data URL (https pages can't load file:// images).
 ipcMain.handle("dr:pick-background", async () => {
   const result = await dialog.showOpenDialog({
     title: "Choose a background image",
     properties: ["openFile"],
-    filters: [
-      { name: "Images", extensions: Object.keys(IMAGE_MIME) },
-    ],
+    filters: [{ name: "Images", extensions: Object.keys(IMAGE_MIME) }],
   });
 
   if (result.canceled || result.filePaths.length === 0) return null;
 
-  const filePath = result.filePaths[0];
-  const ext = path.extname(filePath).slice(1).toLowerCase();
+  const src = result.filePaths[0];
+  const ext = path.extname(src).slice(1).toLowerCase();
+  const destName = `background.${ext}`;
+  const dest = path.join(settingsDir(), destName);
+  fs.copyFileSync(src, dest);
+
+  const s = readSettings();
+  // Clean up a previous background that had a different extension.
+  if (s.backgroundFile && s.backgroundFile !== destName) {
+    try {
+      fs.unlinkSync(path.join(settingsDir(), s.backgroundFile));
+    } catch {}
+  }
+  s.backgroundFile = destName;
+  writeSettings(s);
+
   const mime = IMAGE_MIME[ext] || "application/octet-stream";
-  const base64 = fs.readFileSync(filePath).toString("base64");
-  return `data:${mime};base64,${base64}`;
+  return `data:${mime};base64,${fs.readFileSync(dest).toString("base64")}`;
+});
+
+// Persist the dimming level (saved when the slider is released, not on every
+// pixel of dragging).
+ipcMain.handle("dr:set-dim", (_event, value) => {
+  const s = readSettings();
+  s.dim = value;
+  writeSettings(s);
+});
+
+// Forget the background image.
+ipcMain.handle("dr:remove-background", () => {
+  const s = readSettings();
+  if (s.backgroundFile) {
+    try {
+      fs.unlinkSync(path.join(settingsDir(), s.backgroundFile));
+    } catch {}
+    delete s.backgroundFile;
+    writeSettings(s);
+  }
 });
 
 // Discord sends a strict Content-Security-Policy that would block the styles
