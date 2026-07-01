@@ -13,6 +13,7 @@ const STYLE_ID = "dr-styles";
 const SECTION_ID = "dr-settings-section";
 const ITEM_ID = "dr-settings-item";
 const PAGE_ID = "dr-settings-page";
+const VIDEO_ID = "dr-video-bg";
 
 const log = (...args) => console.log("[DiscordRenewed]", ...args);
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
@@ -22,14 +23,14 @@ const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 // ---------------------------------------------------------------------------
 
 let settings = {}; // all saved customization values, keyed by schema id
-let currentImageUrl = null; // background image (stored on disk as a file)
+let currentBackground = null; // { type: "image"|"video", url } or null
 
 // ---------------------------------------------------------------------------
 // Customization schema — add entries here to add options.
 // ---------------------------------------------------------------------------
 
 const SCHEMA = [
-  { section: "Background", id: "background", type: "background", label: "Background image" },
+  { section: "Background", id: "background", type: "background", label: "Background image or video" },
   { section: "Background", id: "dim", type: "slider", label: "Background dimming", min: 0, max: 100, step: 1, def: 50, suffix: "%" },
   { section: "System", id: "memory", type: "readout", label: "Memory usage" },
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
@@ -58,23 +59,12 @@ function setSetting(id, value) {
 // Building & applying all CSS from the current settings
 // ---------------------------------------------------------------------------
 
-function backgroundCss() {
-  if (!currentImageUrl) return ""; // no wallpaper → leave Discord fully normal
-
-  const dim = clamp(Number(val("dim")) || 0, 0, 100) / 100;
-  const dimC = `rgba(0, 0, 0, ${dim})`;
-
+// The panel-clearing rules shared by both image and video wallpapers: they make
+// Discord's opaque surfaces see-through so the wallpaper behind them shows, while
+// content (avatars, banners, text) stays on top and visible.
+function panelTransparencyCss() {
   return `
-    /* Paint the dimmed wallpaper on the full-window base elements. */
-    html, body, [class*="appMount__"], [class*="app__"], [class*="bg__"] {
-      background-image: linear-gradient(${dimC}, ${dimC}), url("${currentImageUrl}") !important;
-      background-size: cover !important;
-      background-position: center !important;
-      background-repeat: no-repeat !important;
-    }
-
-    /* Clear opaque region fills so the wallpaper shows behind the panels.
-       Content (avatars, banners, text) sits on top and stays visible. */
+    /* Clear opaque region fills so the wallpaper shows behind the panels. */
     aside,
     [class*="guilds__"],
     [class*="container_"],
@@ -108,6 +98,81 @@ function backgroundCss() {
   `;
 }
 
+function backgroundCss() {
+  if (!currentBackground) return ""; // no wallpaper → leave Discord fully normal
+
+  if (currentBackground.type === "video") {
+    // The moving wallpaper is a real <video> element (see syncVideoElement),
+    // sitting behind the app. Here we just make the full-window base elements
+    // transparent so it shows through; dimming is a separate overlay on the video.
+    return `
+      html, body, [class*="appMount__"], [class*="app__"], [class*="bg__"] {
+        background: transparent !important;
+      }
+    ${panelTransparencyCss()}`;
+  }
+
+  // Static image: paint the dimmed wallpaper directly on the base elements.
+  const dim = clamp(Number(val("dim")) || 0, 0, 100) / 100;
+  const dimC = `rgba(0, 0, 0, ${dim})`;
+  return `
+    html, body, [class*="appMount__"], [class*="app__"], [class*="bg__"] {
+      background-image: linear-gradient(${dimC}, ${dimC}), url("${currentBackground.url}") !important;
+      background-size: cover !important;
+      background-position: center !important;
+      background-repeat: no-repeat !important;
+    }
+  ${panelTransparencyCss()}`;
+}
+
+// Create, update, or remove the <video> element used for a moving wallpaper.
+// It lives behind Discord (fixed, z-index -1) with a dimming overlay on top.
+function syncVideoElement() {
+  let wrap = document.getElementById(VIDEO_ID);
+  const isVideo = currentBackground && currentBackground.type === "video";
+
+  if (!isVideo) {
+    wrap?.remove();
+    return;
+  }
+
+  if (!wrap) {
+    wrap = document.createElement("div");
+    wrap.id = VIDEO_ID;
+    Object.assign(wrap.style, {
+      position: "fixed",
+      inset: "0",
+      zIndex: "-1",
+      overflow: "hidden",
+      pointerEvents: "none",
+    });
+
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.loop = true;
+    video.muted = true; // required for autoplay to be allowed
+    video.playsInline = true;
+    Object.assign(video.style, { width: "100%", height: "100%", objectFit: "cover" });
+
+    const overlay = document.createElement("div");
+    overlay.className = "dr-video-dim";
+    Object.assign(overlay.style, { position: "absolute", inset: "0" });
+
+    wrap.append(video, overlay);
+    (document.body || document.documentElement).appendChild(wrap);
+  }
+
+  const video = wrap.querySelector("video");
+  if (video.dataset.drSrc !== currentBackground.url) {
+    video.dataset.drSrc = currentBackground.url;
+    video.src = currentBackground.url;
+    video.play?.().catch(() => {}); // ignore autoplay rejections
+  }
+
+  const dim = clamp(Number(val("dim")) || 0, 0, 100) / 100;
+  wrap.querySelector(".dr-video-dim").style.background = `rgba(0, 0, 0, ${dim})`;
+}
+
 // Combine every section's CSS. Future sections (theme, fonts, custom CSS) get
 // appended here.
 function buildCss() {
@@ -115,6 +180,11 @@ function buildCss() {
 }
 
 function applyStyles() {
+  // Keep the moving-wallpaper <video> (if any) in sync with the current settings,
+  // then rebuild the CSS. Every place that changes a setting calls this, so the
+  // video element and dimming overlay update alongside the styles.
+  syncVideoElement();
+
   let style = document.getElementById(STYLE_ID);
   const css = buildCss();
   if (!css.trim()) {
@@ -134,15 +204,15 @@ function applyStyles() {
 // ---------------------------------------------------------------------------
 
 async function pickBackground() {
-  const url = await ipcRenderer.invoke("dr:pick-background");
-  if (url) {
-    currentImageUrl = url;
+  const resource = await ipcRenderer.invoke("dr:pick-background");
+  if (resource) {
+    currentBackground = resource;
     applyStyles();
   }
 }
 
 function removeBackgroundImage() {
-  currentImageUrl = null;
+  currentBackground = null;
   applyStyles();
   ipcRenderer.invoke("dr:remove-background");
 }
@@ -151,7 +221,7 @@ function removeBackgroundImage() {
 function loadSavedSettings() {
   ipcRenderer.invoke("dr:get-settings").then((s) => {
     if (!s) return;
-    const { image, backgroundFile, ...values } = s;
+    const { background, backgroundFile, backgroundType, image, ...values } = s;
     settings = values;
     // Migrate an older 0–1 dim value to the 0–100 slider scale.
     if (typeof settings.dim === "number" && settings.dim <= 1) {
@@ -161,7 +231,8 @@ function loadSavedSettings() {
     if (!settings.perfMode && settings.lowMemoryMode) settings.perfMode = "Optimised";
     if (settings.perfMode === "Smoothness" || settings.perfMode === "Balanced") settings.perfMode = "Smooth";
     if (settings.perfMode === "Light") settings.perfMode = "Optimised";
-    if (image) currentImageUrl = image;
+    if (background) currentBackground = background;
+    else if (image) currentBackground = { type: "image", url: image }; // legacy
     applyStyles();
   });
 }
@@ -244,12 +315,19 @@ function renderControl(ctrl) {
 
   if (ctrl.type === "background") {
     wrap.appendChild(controlLabel(ctrl.label));
-    const pick = makeButton("Choose image…", "#5865F2");
+    const pick = makeButton("Choose image or video…", "#5865F2");
     pick.addEventListener("click", pickBackground);
     const remove = makeButton("Remove background", "#4e5058");
     remove.style.marginLeft = "10px";
     remove.addEventListener("click", removeBackgroundImage);
     wrap.append(pick, remove);
+
+    const hint = document.createElement("div");
+    hint.textContent =
+      "Images (PNG, JPG, GIF, WebP) or short looping videos (MP4, WebM, MOV). " +
+      "Video plays smoothest on the Smooth performance mode.";
+    Object.assign(hint.style, { marginTop: "10px", fontSize: "12px", opacity: "0.6" });
+    wrap.appendChild(hint);
     return wrap;
   }
 
@@ -554,4 +632,13 @@ window.addEventListener("DOMContentLoaded", () => {
   injectSettings();
   loadSavedSettings();
   log("preload ready");
+});
+
+// Pause a moving wallpaper while the window is hidden/minimized so it isn't
+// decoding video no one can see; resume when it comes back into view.
+document.addEventListener("visibilitychange", () => {
+  const video = document.getElementById(VIDEO_ID)?.querySelector("video");
+  if (!video) return;
+  if (document.hidden) video.pause();
+  else video.play?.().catch(() => {});
 });

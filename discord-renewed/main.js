@@ -3,10 +3,24 @@
 // application window and load Discord into it. Later we'll use this same
 // process to wire up our custom settings.
 
-const { app, BrowserWindow, ipcMain, dialog, session } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, session, protocol, net } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
+const { pathToFileURL } = require("url");
+
+// Register a private URL scheme we use to stream background VIDEOS straight
+// from disk. Images are small enough to hand to the page as base64 data URLs,
+// but a looping video would make an enormous data URL and load entirely into
+// memory. Instead the page references the video as "dr-media://media/<file>"
+// and the handler below streams the file (supporting seeking/looping) with
+// almost no memory cost. Must be declared before the app is "ready".
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "dr-media",
+    privileges: { standard: true, secure: true, stream: true, supportFetchAPI: true, bypassCSP: true },
+  },
+]);
 
 // Discord's web app refuses to load in "unsupported" browsers. Electron's
 // default user-agent string says "Electron", which trips that check, so we
@@ -57,6 +71,16 @@ const IMAGE_MIME = {
   bmp: "image/bmp",
 };
 
+// Video formats we accept for a moving background. These stream via the
+// dr-media:// scheme rather than being inlined as data URLs.
+const VIDEO_MIME = {
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  webm: "video/webm",
+  ogv: "video/ogg",
+  mov: "video/quicktime",
+};
+
 // ---------------------------------------------------------------------------
 // Persistent settings
 // ---------------------------------------------------------------------------
@@ -94,24 +118,31 @@ function writeSettings(settings) {
   }
 }
 
-// Read the saved background image (if any) back as a data URL the page can use.
-function backgroundDataUrl(settings) {
+// Read the saved background (if any) back as something the page can display.
+// Images come back as a base64 data URL; videos come back as a dr-media:// URL
+// that the page's <video> element streams (with a cache-busting "?v=<mtime>" so
+// replacing the file actually reloads it). Returns { type, url } or null.
+function backgroundResource(settings) {
   if (!settings.backgroundFile) return null;
+  const p = path.join(settingsDir(), settings.backgroundFile);
+  const ext = path.extname(p).slice(1).toLowerCase();
   try {
-    const p = path.join(settingsDir(), settings.backgroundFile);
-    const ext = path.extname(p).slice(1).toLowerCase();
+    if (VIDEO_MIME[ext]) {
+      const mtime = Math.round(fs.statSync(p).mtimeMs);
+      return { type: "video", url: `dr-media://media/${settings.backgroundFile}?v=${mtime}` };
+    }
     const mime = IMAGE_MIME[ext] || "application/octet-stream";
-    return `data:${mime};base64,${fs.readFileSync(p).toString("base64")}`;
+    return { type: "image", url: `data:${mime};base64,${fs.readFileSync(p).toString("base64")}` };
   } catch {
     return null; // file went missing
   }
 }
 
 // On startup the preload asks for the saved settings so it can re-apply them.
-// Returns every saved setting plus the background image as a data URL.
+// Returns every saved setting plus the background as a { type, url } resource.
 ipcMain.handle("dr:get-settings", () => {
   const s = readSettings();
-  return { ...s, image: backgroundDataUrl(s) };
+  return { ...s, background: backgroundResource(s) };
 });
 
 // Generic setter: persist any customization value by key.
@@ -121,13 +152,19 @@ ipcMain.handle("dr:set-setting", (_event, key, value) => {
   writeSettings(s);
 });
 
-// Open the native file picker, COPY the chosen image into the app data folder,
-// record it, and return it as a data URL (https pages can't load file:// images).
+// Open the native file picker, COPY the chosen image or video into the app data
+// folder, record it, and return it as a { type, url } resource the page can use
+// (https pages can't load file:// URLs directly, so images become data URLs and
+// videos are streamed through our dr-media:// scheme).
 ipcMain.handle("dr:pick-background", async () => {
   const result = await dialog.showOpenDialog({
-    title: "Choose a background image",
+    title: "Choose a background image or video",
     properties: ["openFile"],
-    filters: [{ name: "Images", extensions: Object.keys(IMAGE_MIME) }],
+    filters: [
+      { name: "Images & Videos", extensions: [...Object.keys(IMAGE_MIME), ...Object.keys(VIDEO_MIME)] },
+      { name: "Images", extensions: Object.keys(IMAGE_MIME) },
+      { name: "Videos", extensions: Object.keys(VIDEO_MIME) },
+    ],
   });
 
   if (result.canceled || result.filePaths.length === 0) return null;
@@ -139,17 +176,18 @@ ipcMain.handle("dr:pick-background", async () => {
   fs.copyFileSync(src, dest);
 
   const s = readSettings();
-  // Clean up a previous background that had a different extension.
+  // Clean up a previous background that had a different extension (e.g. switching
+  // from an image to a video, or png to jpg).
   if (s.backgroundFile && s.backgroundFile !== destName) {
     try {
       fs.unlinkSync(path.join(settingsDir(), s.backgroundFile));
     } catch {}
   }
   s.backgroundFile = destName;
+  s.backgroundType = VIDEO_MIME[ext] ? "video" : "image";
   writeSettings(s);
 
-  const mime = IMAGE_MIME[ext] || "application/octet-stream";
-  return `data:${mime};base64,${fs.readFileSync(dest).toString("base64")}`;
+  return backgroundResource(s);
 });
 
 // Report the real RAM the app is using = the summed PRIVATE working set across
@@ -197,7 +235,7 @@ ipcMain.handle("dr:clear-cache", async () => {
   return true;
 });
 
-// Forget the background image.
+// Forget the background image or video.
 ipcMain.handle("dr:remove-background", () => {
   const s = readSettings();
   if (s.backgroundFile) {
@@ -205,6 +243,7 @@ ipcMain.handle("dr:remove-background", () => {
       fs.unlinkSync(path.join(settingsDir(), s.backgroundFile));
     } catch {}
     delete s.backgroundFile;
+    delete s.backgroundType;
     writeSettings(s);
   }
 });
@@ -279,6 +318,20 @@ if (!gotLock) {
 
   // Electron isn't ready to create windows until the "ready" event fires.
   app.whenReady().then(() => {
+    // Serve background videos from the app data folder over dr-media://. We only
+    // ever hand out our own filenames, but guard against path escapes anyway and
+    // confine reads to the settings folder.
+    protocol.handle("dr-media", (request) => {
+      try {
+        const name = path.basename(decodeURIComponent(new URL(request.url).pathname));
+        const filePath = path.join(settingsDir(), name);
+        if (!filePath.startsWith(settingsDir())) return new Response("Not found", { status: 404 });
+        return net.fetch(pathToFileURL(filePath).toString());
+      } catch {
+        return new Response("Error", { status: 500 });
+      }
+    });
+
     stripContentSecurityPolicy();
     createWindow();
 
