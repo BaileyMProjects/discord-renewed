@@ -145,6 +145,33 @@ ipcMain.handle("dr:pick-background", async () => {
   return `data:${mime};base64,${fs.readFileSync(dest).toString("base64")}`;
 });
 
+// Report current memory use across all of the app's processes. Numbers come
+// from Electron's per-process metrics (workingSetSize is in KB); we sum them and
+// convert to MB, plus a per-process-type breakdown for the readout.
+ipcMain.handle("dr:get-metrics", () => {
+  const metrics = app.getAppMetrics();
+  let totalKB = 0;
+  const byType = {};
+  for (const m of metrics) {
+    const kb = (m.memory && m.memory.workingSetSize) || 0;
+    totalKB += kb;
+    const type = m.type || "other";
+    byType[type] = (byType[type] || 0) + kb;
+  }
+  const toMB = (kb) => Math.round(kb / 1024);
+  const breakdown = Object.fromEntries(
+    Object.entries(byType).map(([type, kb]) => [type, toMB(kb)])
+  );
+  return { totalMB: toMB(totalKB), processCount: metrics.length, byType: breakdown };
+});
+
+// Free up memory on demand by clearing the on-disk/in-memory HTTP cache. This is
+// safe (it doesn't touch the login session), so it won't log the user out.
+ipcMain.handle("dr:clear-cache", async () => {
+  await session.defaultSession.clearCache();
+  return true;
+});
+
 // Forget the background image.
 ipcMain.handle("dr:remove-background", () => {
   const s = readSettings();
@@ -173,6 +200,19 @@ function stripContentSecurityPolicy() {
     callback({ responseHeaders: headers });
   });
 }
+
+// If the user turned on "Low memory mode", apply memory-saving Chromium
+// switches. These MUST be set before the app is ready, so we read the saved
+// settings synchronously here (wrapped in try/catch so a bad read just skips it).
+// The gains are modest — this mainly caps renderer processes and disables a few
+// background features; it can't shrink Discord's own footprint.
+try {
+  const startup = readSettings();
+  if (startup.lowMemoryMode) {
+    app.commandLine.appendSwitch("renderer-process-limit", "1");
+    app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
+  }
+} catch {}
 
 // Allow only ONE instance at a time. Running several at once makes them fight
 // over the same cache folder (the "disk_cache: Access is denied" errors), which

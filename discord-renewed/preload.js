@@ -31,6 +31,9 @@ let currentImageUrl = null; // background image (stored on disk as a file)
 const SCHEMA = [
   { section: "Background", id: "background", type: "background", label: "Background image" },
   { section: "Background", id: "dim", type: "slider", label: "Background dimming", min: 0, max: 100, step: 1, def: 50, suffix: "%" },
+  { section: "System", id: "memory", type: "readout", label: "Memory usage" },
+  { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
+  { section: "System", id: "lowMemoryMode", type: "toggle", label: "Low memory mode — fewer background processes (applies after restart)", def: false },
 ];
 
 function schemaFor(id) {
@@ -194,6 +197,60 @@ function controlLabel(text) {
   return el;
 }
 
+// Friendlier names for Electron's process types in the memory readout.
+const PROC_LABELS = { Browser: "App core", Tab: "Discord", GPU: "Graphics", Utility: "Helpers" };
+
+// Paint a memory-metrics object (from dr:get-metrics) into a container element.
+function renderMetrics(box, m) {
+  box.innerHTML = "";
+
+  const total = document.createElement("div");
+  Object.assign(total.style, {
+    fontSize: "22px",
+    fontWeight: "700",
+    color: "var(--header-primary, #f2f3f5)",
+  });
+  total.textContent = `${m.totalMB} MB`;
+
+  const sub = document.createElement("div");
+  Object.assign(sub.style, { fontSize: "12px", opacity: "0.7", marginBottom: "10px" });
+  sub.textContent = `across ${m.processCount} process${m.processCount === 1 ? "" : "es"}`;
+
+  box.append(total, sub);
+
+  const entries = Object.entries(m.byType || {}).sort((a, b) => b[1] - a[1]);
+  for (const [type, mb] of entries) {
+    const row = document.createElement("div");
+    Object.assign(row.style, {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: "13px",
+      padding: "2px 0",
+    });
+    const name = document.createElement("span");
+    name.textContent = PROC_LABELS[type] || type;
+    const value = document.createElement("span");
+    value.textContent = `${mb} MB`;
+    row.append(name, value);
+    box.appendChild(row);
+  }
+}
+
+// Handle a button control's action, with brief visual feedback on the button.
+function runButtonAction(action, btn) {
+  if (action === "clear-cache") {
+    const original = btn.textContent;
+    btn.disabled = true;
+    ipcRenderer.invoke("dr:clear-cache").then(() => {
+      btn.textContent = "Cache cleared ✓";
+      setTimeout(() => {
+        btn.textContent = original;
+        btn.disabled = false;
+      }, 1500);
+    });
+  }
+}
+
 function renderControl(ctrl) {
   const wrap = document.createElement("div");
   wrap.style.marginBottom = "24px";
@@ -252,6 +309,33 @@ function renderControl(ctrl) {
     text.textContent = ctrl.label;
     row.append(input, text);
     wrap.appendChild(row);
+    return wrap;
+  }
+
+  if (ctrl.type === "readout") {
+    wrap.appendChild(controlLabel(ctrl.label));
+    const box = document.createElement("div");
+    Object.assign(box.style, {
+      padding: "14px 16px",
+      borderRadius: "8px",
+      background: "rgba(0, 0, 0, 0.25)",
+      border: "1px solid rgba(255, 255, 255, 0.08)",
+      fontSize: "14px",
+      color: "var(--text-normal, #dbdee1)",
+    });
+    box.textContent = "Measuring…";
+    const refresh = () =>
+      ipcRenderer.invoke("dr:get-metrics").then((m) => m && renderMetrics(box, m));
+    refresh();
+    pageIntervals.push(setInterval(refresh, 2000)); // stopped in hidePage()
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  if (ctrl.type === "button") {
+    const b = makeButton(ctrl.label, ctrl.bg || "#4e5058");
+    b.addEventListener("click", () => runButtonAction(ctrl.action, b));
+    wrap.appendChild(b);
     return wrap;
   }
 
@@ -369,6 +453,7 @@ function setItemActive(active) {
 }
 
 let hiddenContent = [];
+let pageIntervals = []; // live-updating timers (e.g. the memory readout)
 
 function hidePage() {
   document.getElementById(PAGE_ID)?.remove();
@@ -376,6 +461,8 @@ function hidePage() {
     if (c.isConnected) c.style.display = "";
   });
   hiddenContent = [];
+  pageIntervals.forEach(clearInterval);
+  pageIntervals = [];
   setItemActive(false);
 }
 
