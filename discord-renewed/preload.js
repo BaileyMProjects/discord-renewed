@@ -1,89 +1,77 @@
 // preload.js — runs INSIDE the Discord page, before it loads.
 //
-// This is our "safe bridge": it can touch the Discord page's DOM, but Discord's
-// own code can't reach Node. Our customization is reached through Discord's own
-// settings (BetterDiscord-style): we add a "Discord Renewed" section at the
-// bottom of the settings sidebar, and clicking our item opens a real settings
-// PAGE in the content pane — same look and feel as Discord's own pages.
+// Our "safe bridge": it can touch the Discord page's DOM, but Discord's own code
+// can't reach Node. Customization is reached through Discord's own settings: we
+// add a "Discord Renewed" section to the settings sidebar, and our item opens a
+// settings page whose controls are generated from a SCHEMA (below). Every
+// control auto-saves to the persistent store and auto-applies. To add a new
+// customization, add an entry to SCHEMA and (if needed) a line to buildCss().
 
 const { ipcRenderer } = require("electron");
 
-const STYLE_ID = "dr-background-style";
+const STYLE_ID = "dr-styles";
 const SECTION_ID = "dr-settings-section";
 const ITEM_ID = "dr-settings-item";
 const PAGE_ID = "dr-settings-page";
 
 const log = (...args) => console.log("[DiscordRenewed]", ...args);
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
 // ---------------------------------------------------------------------------
-// Applying the background
+// State
 // ---------------------------------------------------------------------------
 
-// Current background state (session-only for now; persistence comes later).
-let currentImageUrl = null;
-let dimOpacity = 0.5; // 0 = image fully visible, 1 = fully dark. Default: readable.
+let settings = {}; // all saved customization values, keyed by schema id
+let currentImageUrl = null; // background image (stored on disk as a file)
 
-function setBackgroundImage(imageUrl) {
-  currentImageUrl = imageUrl;
-  renderBackground();
+// ---------------------------------------------------------------------------
+// Customization schema — add entries here to add options.
+// ---------------------------------------------------------------------------
+
+const SCHEMA = [
+  { section: "Background", id: "background", type: "background", label: "Background image" },
+  { section: "Background", id: "dim", type: "slider", label: "Background dimming", min: 0, max: 100, step: 1, def: 50, suffix: "%" },
+];
+
+function schemaFor(id) {
+  return SCHEMA.find((c) => c.id === id);
 }
 
-function setDimOpacity(value) {
-  dimOpacity = Math.min(1, Math.max(0, value));
-  renderBackground();
+// Current value for a setting, falling back to its schema default.
+function val(id) {
+  const v = settings[id];
+  if (v !== undefined && v !== null) return v;
+  const c = schemaFor(id);
+  return c ? c.def : undefined;
 }
 
-function removeBackground() {
-  currentImageUrl = null;
-  renderBackground();
-  ipcRenderer.invoke("dr:remove-background");
+function setSetting(id, value) {
+  settings[id] = value;
+  ipcRenderer.invoke("dr:set-setting", id, value);
+  applyStyles();
 }
 
-// Load saved settings (background + dimming) and apply them. Called on startup
-// so nothing resets between launches.
-function loadSavedSettings() {
-  ipcRenderer.invoke("dr:get-settings").then((s) => {
-    if (!s) return;
-    if (typeof s.dim === "number") dimOpacity = s.dim;
-    if (s.image) currentImageUrl = s.image;
-    renderBackground();
-  });
-}
+// ---------------------------------------------------------------------------
+// Building & applying all CSS from the current settings
+// ---------------------------------------------------------------------------
 
-function renderBackground() {
-  let style = document.getElementById(STYLE_ID);
+function backgroundCss() {
+  if (!currentImageUrl) return ""; // no wallpaper → leave Discord fully normal
 
-  if (!currentImageUrl) {
-    style?.remove();
-    return;
-  }
-  if (!style) {
-    style = document.createElement("style");
-    style.id = STYLE_ID;
-    document.head.appendChild(style);
-  }
+  const dim = clamp(Number(val("dim")) || 0, 0, 100) / 100;
+  const dimC = `rgba(0, 0, 0, ${dim})`;
 
-  // A dark layer over the image (the "dimming") keeps text readable.
-  const dim = `rgba(0, 0, 0, ${dimOpacity})`;
-
-  style.textContent = `
-    /* Paint the dimmed image on the full-window base layers. bg__ is the actual
-       full-screen backdrop (sits above app__/appMount), so painting it gives one
-       continuous wallpaper without per-panel tiling or fixed attachment. */
-    html, body,
-    [class*="appMount__"],
-    [class*="app__"],
-    [class*="bg__"] {
-      background-image: linear-gradient(${dim}, ${dim}), url("${currentImageUrl}") !important;
+  return `
+    /* Paint the dimmed wallpaper on the full-window base elements. */
+    html, body, [class*="appMount__"], [class*="app__"], [class*="bg__"] {
+      background-image: linear-gradient(${dimC}, ${dimC}), url("${currentImageUrl}") !important;
       background-size: cover !important;
       background-position: center !important;
       background-repeat: no-repeat !important;
     }
 
-    /* Clear the opaque region fills so the wallpaper shows behind them. These
-       are the main-app panels (server rail, channel/DM list, chat, member list,
-       friends page, message box). Content (avatars, banners, text) sits on top
-       and stays visible. */
+    /* Clear opaque region fills so the wallpaper shows behind the panels.
+       Content (avatars, banners, text) sits on top and stays visible. */
     aside,
     [class*="guilds__"],
     [class*="container_"],
@@ -101,50 +89,79 @@ function renderBackground() {
       background-color: transparent !important;
     }
 
-    /* The bottom-left user bar and the message text box stay transparent but get
-       a subtle outline so they still read as distinct bars. */
+    /* Keep the Settings window panels normal; only the area around them shows
+       the wallpaper. */
+    [class*="outerContainer_"] [class*="sidebar_"] { background-color: #2b2d31 !important; }
+    [class*="outerContainer_"] [class*="content_"] { background-color: #313338 !important; }
+
+    /* User bar + message box: transparent with a subtle outline so they read
+       as distinct bars. */
     [class*="panels_"],
     [class*="channelTextArea_"] {
       background-color: transparent !important;
       border: 1px solid rgba(255, 255, 255, 0.12) !important;
       border-radius: 8px !important;
     }
-
-    /* Settings: keep the PANELS (sidebar + content) normal/opaque, but leave the
-       area AROUND them transparent (so it shows the wallpaper, not a grey block).
-       Scoped under …outerContainer_ so the main-app sidebar/content aren't hit.
-       The descendant selectors out-specify the transparency rules above. */
-    [class*="outerContainer_"] [class*="sidebar_"] {
-      background-color: #2b2d31 !important;
-    }
-    [class*="outerContainer_"] [class*="content_"] {
-      background-color: #313338 !important;
-    }
   `;
 }
 
-// ---------------------------------------------------------------------------
-// Small DOM helpers
-// ---------------------------------------------------------------------------
-
-// Deepest elements whose trimmed text is exactly `text`.
-function findLeavesByText(text) {
-  return Array.from(document.querySelectorAll("div,button,a,span,h1,h2")).filter(
-    (el) =>
-      (el.textContent || "").trim() === text &&
-      !Array.from(el.children).some((c) => (c.textContent || "").trim() === text)
-  );
+// Combine every section's CSS. Future sections (theme, fonts, custom CSS) get
+// appended here.
+function buildCss() {
+  return backgroundCss();
 }
 
-// Replace the first text label inside an item with `newText`.
-function relabelItem(root, newText) {
-  const content = root.querySelector('[class*="itemContent_"]') || root;
-  const leaf = Array.from(content.querySelectorAll("*")).find(
-    (el) => el.childElementCount === 0 && (el.textContent || "").trim().length > 0
-  );
-  if (leaf) leaf.textContent = newText;
-  else content.textContent = newText;
+function applyStyles() {
+  let style = document.getElementById(STYLE_ID);
+  const css = buildCss();
+  if (!css.trim()) {
+    style?.remove();
+    return;
+  }
+  if (!style) {
+    style = document.createElement("style");
+    style.id = STYLE_ID;
+    document.head.appendChild(style);
+  }
+  style.textContent = css;
 }
+
+// ---------------------------------------------------------------------------
+// Background image (stored as a file, so handled specially)
+// ---------------------------------------------------------------------------
+
+async function pickBackground() {
+  const url = await ipcRenderer.invoke("dr:pick-background");
+  if (url) {
+    currentImageUrl = url;
+    applyStyles();
+  }
+}
+
+function removeBackgroundImage() {
+  currentImageUrl = null;
+  applyStyles();
+  ipcRenderer.invoke("dr:remove-background");
+}
+
+// Load saved settings on startup and apply them, so nothing resets on close.
+function loadSavedSettings() {
+  ipcRenderer.invoke("dr:get-settings").then((s) => {
+    if (!s) return;
+    const { image, backgroundFile, ...values } = s;
+    settings = values;
+    // Migrate an older 0–1 dim value to the 0–100 slider scale.
+    if (typeof settings.dim === "number" && settings.dim <= 1) {
+      settings.dim = Math.round(settings.dim * 100);
+    }
+    if (image) currentImageUrl = image;
+    applyStyles();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Rendering the settings page from the schema
+// ---------------------------------------------------------------------------
 
 function makeButton(text, bg) {
   const b = document.createElement("button");
@@ -162,13 +179,177 @@ function makeButton(text, bg) {
   return b;
 }
 
+function controlLabel(text) {
+  const el = document.createElement("label");
+  el.textContent = text;
+  Object.assign(el.style, {
+    display: "block",
+    marginBottom: "8px",
+    fontSize: "12px",
+    fontWeight: "700",
+    letterSpacing: "0.02em",
+    textTransform: "uppercase",
+    color: "var(--header-secondary, #b5bac1)",
+  });
+  return el;
+}
+
+function renderControl(ctrl) {
+  const wrap = document.createElement("div");
+  wrap.style.marginBottom = "24px";
+
+  if (ctrl.type === "background") {
+    wrap.appendChild(controlLabel(ctrl.label));
+    const pick = makeButton("Choose image…", "#5865F2");
+    pick.addEventListener("click", pickBackground);
+    const remove = makeButton("Remove background", "#4e5058");
+    remove.style.marginLeft = "10px";
+    remove.addEventListener("click", removeBackgroundImage);
+    wrap.append(pick, remove);
+    return wrap;
+  }
+
+  if (ctrl.type === "slider") {
+    const label = controlLabel(`${ctrl.label} — ${val(ctrl.id)}${ctrl.suffix || ""}`);
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = String(ctrl.min);
+    input.max = String(ctrl.max);
+    input.step = String(ctrl.step || 1);
+    input.value = String(val(ctrl.id));
+    input.style.width = "320px";
+    input.style.maxWidth = "100%";
+    input.addEventListener("input", () => {
+      label.textContent = `${ctrl.label} — ${input.value}${ctrl.suffix || ""}`;
+      settings[ctrl.id] = Number(input.value);
+      applyStyles(); // live preview
+    });
+    input.addEventListener("change", () => {
+      setSetting(ctrl.id, Number(input.value)); // persist on release
+    });
+    wrap.append(label, input);
+    return wrap;
+  }
+
+  if (ctrl.type === "toggle") {
+    const row = document.createElement("label");
+    Object.assign(row.style, {
+      display: "flex",
+      alignItems: "center",
+      gap: "12px",
+      cursor: "pointer",
+      fontSize: "14px",
+      color: "var(--text-normal, #dbdee1)",
+    });
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(val(ctrl.id));
+    input.style.width = "18px";
+    input.style.height = "18px";
+    input.style.cursor = "pointer";
+    input.addEventListener("change", () => setSetting(ctrl.id, input.checked));
+    const text = document.createElement("span");
+    text.textContent = ctrl.label;
+    row.append(input, text);
+    wrap.appendChild(row);
+    return wrap;
+  }
+
+  if (ctrl.type === "select") {
+    wrap.appendChild(controlLabel(ctrl.label));
+    const select = document.createElement("select");
+    Object.assign(select.style, {
+      padding: "8px 10px",
+      borderRadius: "6px",
+      background: "#1e1f22",
+      color: "#dbdee1",
+      border: "1px solid rgba(255,255,255,0.1)",
+      fontSize: "14px",
+      textTransform: "capitalize",
+    });
+    ctrl.choices.forEach((choice) => {
+      const opt = document.createElement("option");
+      opt.value = choice;
+      opt.textContent = choice;
+      if (choice === val(ctrl.id)) opt.selected = true;
+      select.appendChild(opt);
+    });
+    select.addEventListener("change", () => setSetting(ctrl.id, select.value));
+    wrap.appendChild(select);
+    return wrap;
+  }
+
+  return wrap;
+}
+
+function buildPageContent() {
+  const inner = document.createElement("div");
+  Object.assign(inner.style, { maxWidth: "740px", padding: "60px 40px 80px", boxSizing: "border-box" });
+
+  const title = document.createElement("h2");
+  title.textContent = "Discord Renewed";
+  Object.assign(title.style, {
+    margin: "0 0 24px",
+    fontSize: "20px",
+    fontWeight: "700",
+    color: "var(--header-primary, #f2f3f5)",
+  });
+  inner.appendChild(title);
+
+  // Group controls by section, in first-seen order.
+  const sections = [];
+  for (const ctrl of SCHEMA) {
+    let group = sections.find((g) => g.name === ctrl.section);
+    if (!group) {
+      group = { name: ctrl.section, controls: [] };
+      sections.push(group);
+    }
+    group.controls.push(ctrl);
+  }
+
+  for (const group of sections) {
+    const heading = document.createElement("h3");
+    heading.textContent = group.name;
+    Object.assign(heading.style, {
+      margin: "8px 0 16px",
+      fontSize: "16px",
+      fontWeight: "600",
+      color: "var(--header-primary, #f2f3f5)",
+      borderBottom: "1px solid rgba(255,255,255,0.08)",
+      paddingBottom: "8px",
+    });
+    inner.appendChild(heading);
+    group.controls.forEach((ctrl) => inner.appendChild(renderControl(ctrl)));
+  }
+
+  return inner;
+}
+
+// ---------------------------------------------------------------------------
+// Small DOM helpers for injecting into Discord's settings
+// ---------------------------------------------------------------------------
+
+function findLeavesByText(text) {
+  return Array.from(document.querySelectorAll("div,button,a,span,h1,h2")).filter(
+    (el) =>
+      (el.textContent || "").trim() === text &&
+      !Array.from(el.children).some((c) => (c.textContent || "").trim() === text)
+  );
+}
+
+function relabelItem(root, newText) {
+  const content = root.querySelector('[class*="itemContent_"]') || root;
+  const leaf = Array.from(content.querySelectorAll("*")).find(
+    (el) => el.childElementCount === 0 && (el.textContent || "").trim().length > 0
+  );
+  if (leaf) leaf.textContent = newText;
+  else content.textContent = newText;
+}
+
 // ---------------------------------------------------------------------------
 // Our settings PAGE (rendered into Discord's settings content pane)
 // ---------------------------------------------------------------------------
 
-// The content pane is the sibling of the settings sidebar inside the settings
-// container (…sidebar__409aa and …content_e9e3ed share a parent). Anchor on our
-// own item so we get the settings sidebar specifically, not some other sidebar.
 function findContentPane() {
   const ours = document.getElementById(ITEM_ID) || document.getElementById(SECTION_ID);
   const aside = ours
@@ -187,7 +368,6 @@ function setItemActive(active) {
     : "";
 }
 
-// Discord's content nodes we hid while our page is shown (so we can restore).
 let hiddenContent = [];
 
 function hidePage() {
@@ -204,93 +384,13 @@ function showPage() {
   const pane = findContentPane();
   if (!pane) return;
 
-  // Hide Discord's current page (instead of covering it) so our page can be
-  // transparent and match the rest of the now-see-through settings.
+  // Hide Discord's current page so ours can sit in the same place.
   hiddenContent = Array.from(pane.children);
   hiddenContent.forEach((c) => (c.style.display = "none"));
 
   const overlay = document.createElement("div");
   overlay.id = PAGE_ID;
-
-  const inner = document.createElement("div");
-  Object.assign(inner.style, {
-    maxWidth: "740px",
-    padding: "60px 40px 80px",
-    boxSizing: "border-box",
-  });
-
-  const title = document.createElement("h2");
-  title.textContent = "Background";
-  Object.assign(title.style, {
-    margin: "0 0 8px",
-    fontSize: "20px",
-    fontWeight: "700",
-    color: "var(--header-primary, #f2f3f5)",
-  });
-
-  const desc = document.createElement("p");
-  desc.textContent = "Set a custom background image for Discord Renewed.";
-  Object.assign(desc.style, {
-    margin: "0 0 24px",
-    fontSize: "14px",
-    color: "var(--text-normal, #dbdee1)",
-  });
-
-  const pickBtn = makeButton("Choose image…", "#5865F2");
-  pickBtn.addEventListener("click", async () => {
-    const imageUrl = await ipcRenderer.invoke("dr:pick-background");
-    if (imageUrl) setBackgroundImage(imageUrl);
-  });
-
-  const resetBtn = makeButton("Remove background", "#4e5058");
-  resetBtn.style.marginLeft = "10px";
-  resetBtn.addEventListener("click", removeBackground);
-
-  // --- Dimming slider -------------------------------------------------------
-  const sliderWrap = document.createElement("div");
-  sliderWrap.style.marginTop = "32px";
-
-  const sliderLabel = document.createElement("label");
-  Object.assign(sliderLabel.style, {
-    display: "block",
-    marginBottom: "8px",
-    fontSize: "12px",
-    fontWeight: "700",
-    letterSpacing: "0.02em",
-    textTransform: "uppercase",
-    color: "var(--header-secondary, #b5bac1)",
-  });
-  const pct = () => `${Math.round(dimOpacity * 100)}%`;
-  sliderLabel.textContent = `Background dimming — ${pct()}`;
-
-  const slider = document.createElement("input");
-  slider.type = "range";
-  slider.min = "0";
-  slider.max = "100";
-  slider.value = String(Math.round(dimOpacity * 100));
-  slider.style.width = "320px";
-  slider.style.maxWidth = "100%";
-  slider.addEventListener("input", () => {
-    setDimOpacity(Number(slider.value) / 100);
-    sliderLabel.textContent = `Background dimming — ${pct()}`;
-  });
-  // Persist once the user releases the slider (avoids saving on every pixel).
-  slider.addEventListener("change", () => {
-    ipcRenderer.invoke("dr:set-dim", dimOpacity);
-  });
-
-  const sliderHint = document.createElement("p");
-  sliderHint.textContent = "Higher dimming makes text easier to read over the image.";
-  Object.assign(sliderHint.style, {
-    margin: "8px 0 0",
-    fontSize: "12px",
-    color: "var(--text-muted, #949ba4)",
-  });
-
-  sliderWrap.append(sliderLabel, slider, sliderHint);
-
-  inner.append(title, desc, pickBtn, resetBtn, sliderWrap);
-  overlay.appendChild(inner);
+  overlay.appendChild(buildPageContent());
   pane.appendChild(overlay);
   setItemActive(true);
 }
@@ -299,8 +399,6 @@ function showPage() {
 // Injecting our section into the settings sidebar
 // ---------------------------------------------------------------------------
 
-// When any sidebar item OTHER than ours is clicked, close our page (Discord is
-// navigating to one of its own pages).
 function watchNav() {
   const nav = document.querySelector('[class*="nav__"]');
   if (!nav || nav.__drWatched) return;
@@ -319,24 +417,21 @@ function watchNav() {
 function injectSettings() {
   if (document.getElementById(SECTION_ID)) return; // already injected
 
-  // Walk the known sidebar structure up from the "Appearance" label.
   const leaf = findLeavesByText("Appearance")[0];
   if (!leaf) return; // not on the settings screen
   const content = leaf.closest('[class*="itemContent_"]');
   if (!content) return;
-  const sectionList = content.parentElement?.parentElement?.parentElement; // …sectionList
-  const sectionLI = sectionList?.parentElement; // …section
-  const sublist = sectionLI?.parentElement; // …sublist (all sections)
+  const sectionList = content.parentElement?.parentElement?.parentElement;
+  const sectionLI = sectionList?.parentElement;
+  const sublist = sectionLI?.parentElement;
   if (!sublist) return;
 
-  // Clone a whole section so we inherit Discord's exact label + item styling.
   const section = sectionLI.cloneNode(true);
   section.id = SECTION_ID;
 
   const label = section.querySelector('[class*="sectionLabel__"]');
   if (label) label.textContent = "Discord Renewed";
 
-  // Keep only the first item as our template; remove the rest.
   const itemsUL = section.querySelector('[class*="sectionList__"]');
   while (itemsUL.children.length > 1) itemsUL.removeChild(itemsUL.lastElementChild);
 
@@ -350,7 +445,7 @@ function injectSettings() {
       if (/selected|active/i.test(c)) el.classList.remove(c);
     });
   });
-  relabelItem(ourLI, "Background");
+  relabelItem(ourLI, "Customize");
 
   const clickable = ourLI.querySelector('[class*="itemContent_"]')?.parentElement || ourLI;
   clickable.addEventListener("click", (e) => {
@@ -358,8 +453,6 @@ function injectSettings() {
     showPage();
   });
 
-  // Insert our section just ABOVE the "Log Out" entry (keep it last-ish but
-  // before logout), falling back to the end of the list.
   const logoutLeaf = findLeavesByText("Log Out")[0];
   const beforeNode = logoutLeaf
     ? Array.from(sublist.children).find((child) => child.contains(logoutLeaf))
@@ -368,7 +461,7 @@ function injectSettings() {
   else sublist.appendChild(section);
 
   watchNav();
-  log("settings section injected" + (beforeNode ? " above Log Out" : " at bottom"));
+  log("settings section injected");
 }
 
 // Discord re-renders constantly and the settings screen only exists while open,

@@ -101,12 +101,17 @@ function backgroundDataUrl(settings) {
 }
 
 // On startup the preload asks for the saved settings so it can re-apply them.
+// Returns every saved setting plus the background image as a data URL.
 ipcMain.handle("dr:get-settings", () => {
   const s = readSettings();
-  return {
-    image: backgroundDataUrl(s),
-    dim: typeof s.dim === "number" ? s.dim : 0.5,
-  };
+  return { ...s, image: backgroundDataUrl(s) };
+});
+
+// Generic setter: persist any customization value by key.
+ipcMain.handle("dr:set-setting", (_event, key, value) => {
+  const s = readSettings();
+  s[key] = value;
+  writeSettings(s);
 });
 
 // Open the native file picker, COPY the chosen image into the app data folder,
@@ -138,14 +143,6 @@ ipcMain.handle("dr:pick-background", async () => {
 
   const mime = IMAGE_MIME[ext] || "application/octet-stream";
   return `data:${mime};base64,${fs.readFileSync(dest).toString("base64")}`;
-});
-
-// Persist the dimming level (saved when the slider is released, not on every
-// pixel of dragging).
-ipcMain.handle("dr:set-dim", (_event, value) => {
-  const s = readSettings();
-  s.dim = value;
-  writeSettings(s);
 });
 
 // Forget the background image.
