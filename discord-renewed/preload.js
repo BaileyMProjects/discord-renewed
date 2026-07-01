@@ -33,7 +33,7 @@ const SCHEMA = [
   { section: "Background", id: "dim", type: "slider", label: "Background dimming", min: 0, max: 100, step: 1, def: 50, suffix: "%" },
   { section: "System", id: "memory", type: "readout", label: "Memory usage" },
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
-  { section: "System", id: "perfMode", type: "select", label: "Performance mode — Smooth = full GPU acceleration (default). Light = GPU off, saves ~250 MB / ~35% RAM but video, screen share and animations get clunkier. Applies after restart.", choices: ["Smooth", "Light"], def: "Smooth" },
+  { section: "System", id: "perfMode", type: "select", label: "Performance mode (applies after restart). Measured RAM vs Discord's ~590 MB — Smooth: full GPU, ~490 MB (~17% lighter), buttery. Optimised: GPU off, ~380 MB (~36% lighter) but video/screen-share/animation get clunkier.", choices: ["Smooth", "Optimised"], def: "Smooth" },
 ];
 
 function schemaFor(id) {
@@ -157,8 +157,10 @@ function loadSavedSettings() {
     if (typeof settings.dim === "number" && settings.dim <= 1) {
       settings.dim = Math.round(settings.dim * 100);
     }
-    // Migrate the old on/off low-memory toggle to the new performance modes.
-    if (!settings.perfMode && settings.lowMemoryMode) settings.perfMode = "Light";
+    // Migrate older performance settings to the current mode names.
+    if (!settings.perfMode && settings.lowMemoryMode) settings.perfMode = "Optimised";
+    if (settings.perfMode === "Smoothness" || settings.perfMode === "Balanced") settings.perfMode = "Smooth";
+    if (settings.perfMode === "Light") settings.perfMode = "Optimised";
     if (image) currentImageUrl = image;
     applyStyles();
   });
@@ -199,10 +201,8 @@ function controlLabel(text) {
   return el;
 }
 
-// Friendlier names for Electron's process types in the memory readout.
-const PROC_LABELS = { Browser: "App core", Tab: "Discord", GPU: "Graphics", Utility: "Helpers" };
-
 // Paint a memory-metrics object (from dr:get-metrics) into a container element.
+// totalMB is the real physical RAM (private working set), matching Task Manager.
 function renderMetrics(box, m) {
   box.innerHTML = "";
 
@@ -215,27 +215,12 @@ function renderMetrics(box, m) {
   total.textContent = `${m.totalMB} MB`;
 
   const sub = document.createElement("div");
-  Object.assign(sub.style, { fontSize: "12px", opacity: "0.7", marginBottom: "10px" });
-  sub.textContent = `across ${m.processCount} process${m.processCount === 1 ? "" : "es"}`;
+  Object.assign(sub.style, { fontSize: "12px", opacity: "0.7" });
+  sub.textContent =
+    `real RAM · ${m.processCount} process${m.processCount === 1 ? "" : "es"}` +
+    (m.approximate ? " · approx" : "");
 
   box.append(total, sub);
-
-  const entries = Object.entries(m.byType || {}).sort((a, b) => b[1] - a[1]);
-  for (const [type, mb] of entries) {
-    const row = document.createElement("div");
-    Object.assign(row.style, {
-      display: "flex",
-      justifyContent: "space-between",
-      fontSize: "13px",
-      padding: "2px 0",
-    });
-    const name = document.createElement("span");
-    name.textContent = PROC_LABELS[type] || type;
-    const value = document.createElement("span");
-    value.textContent = `${mb} MB`;
-    row.append(name, value);
-    box.appendChild(row);
-  }
 }
 
 // Handle a button control's action, with brief visual feedback on the button.
@@ -326,10 +311,18 @@ function renderControl(ctrl) {
       color: "var(--text-normal, #dbdee1)",
     });
     box.textContent = "Measuring…";
-    const refresh = () =>
-      ipcRenderer.invoke("dr:get-metrics").then((m) => m && renderMetrics(box, m));
+    // The query spawns typeperf (~1-2s), so guard against overlapping polls.
+    let busy = false;
+    const refresh = () => {
+      if (busy) return;
+      busy = true;
+      ipcRenderer
+        .invoke("dr:get-metrics")
+        .then((m) => m && renderMetrics(box, m))
+        .finally(() => (busy = false));
+    };
     refresh();
-    pageIntervals.push(setInterval(refresh, 2000)); // stopped in hidePage()
+    pageIntervals.push(setInterval(refresh, 3000)); // stopped in hidePage()
     wrap.appendChild(box);
     return wrap;
   }

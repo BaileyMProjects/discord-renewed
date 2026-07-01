@@ -6,6 +6,7 @@
 const { app, BrowserWindow, ipcMain, dialog, session } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { execFile } = require("child_process");
 
 // Discord's web app refuses to load in "unsupported" browsers. Electron's
 // default user-agent string says "Electron", which trips that check, so we
@@ -151,24 +152,42 @@ ipcMain.handle("dr:pick-background", async () => {
   return `data:${mime};base64,${fs.readFileSync(dest).toString("base64")}`;
 });
 
-// Report current memory use across all of the app's processes. Numbers come
-// from Electron's per-process metrics (workingSetSize is in KB); we sum them and
-// convert to MB, plus a per-process-type breakdown for the readout.
+// Report the real RAM the app is using = the summed PRIVATE working set across
+// all its processes, which is what Task Manager's "Memory" column shows. We can't
+// use app.getAppMetrics() for this: it only exposes total working set, which
+// double-counts Chromium's shared memory and reads roughly 2x too high (~1GB vs
+// the true ~470MB). Instead we query Windows' typeperf. It spawns a short-lived
+// process, but the meter is only polled while the settings page is open, so the
+// cost is negligible. Falls back to the (over-reporting) working-set sum on error.
 ipcMain.handle("dr:get-metrics", () => {
-  const metrics = app.getAppMetrics();
-  let totalKB = 0;
-  const byType = {};
-  for (const m of metrics) {
-    const kb = (m.memory && m.memory.workingSetSize) || 0;
-    totalKB += kb;
-    const type = m.type || "other";
-    byType[type] = (byType[type] || 0) + kb;
-  }
-  const toMB = (kb) => Math.round(kb / 1024);
-  const breakdown = Object.fromEntries(
-    Object.entries(byType).map(([type, kb]) => [type, toMB(kb)])
-  );
-  return { totalMB: toMB(totalKB), processCount: metrics.length, byType: breakdown };
+  const processCount = app.getAppMetrics().length;
+  return new Promise((resolve) => {
+    execFile(
+      "typeperf",
+      ["\\Process(electron*)\\Working Set - Private", "-sc", "1"],
+      { timeout: 6000, windowsHide: true },
+      (err, stdout) => {
+        let totalMB = null;
+        if (!err && stdout) {
+          // typeperf prints a header line then one CSV sample line; each column
+          // after the timestamp is one electron process's private working set.
+          const rows = stdout.split(/\r?\n/).filter((l) => l.startsWith('"'));
+          const sample = rows[rows.length - 1];
+          if (sample) {
+            const cols = sample.split('","').map((s) => s.replace(/"/g, ""));
+            const bytes = cols.slice(1).reduce((sum, v) => sum + (parseFloat(v) || 0), 0);
+            if (bytes > 0) totalMB = Math.round(bytes / (1024 * 1024));
+          }
+        }
+        if (totalMB !== null) return resolve({ totalMB, processCount, approximate: false });
+        // Fallback: summed working set (over-reports, but better than nothing).
+        const kb = app
+          .getAppMetrics()
+          .reduce((s, m) => s + ((m.memory && m.memory.workingSetSize) || 0), 0);
+        resolve({ totalMB: Math.round(kb / 1024), processCount, approximate: true });
+      }
+    );
+  });
 });
 
 // Free up memory on demand by clearing the on-disk/in-memory HTTP cache. This is
@@ -221,16 +240,21 @@ try {
   // pre-ready) + the app folder name instead. Keep in sync with package.json name.
   const earlyFile = path.join(app.getPath("appData"), "discord-renewed", "settings.json");
   const startup = parseSettings(fs.readFileSync(earlyFile, "utf8"));
-  // Performance tiers (measured 2026-07-01, committed RAM):
-  //   Smooth (default) → no flags, full GPU acceleration (~620-700MB).
-  //   Light            → --disable-gpu skips the GPU process, the big saver
-  //                      (~450MB, ~35% less), at the cost of smoother video /
-  //                      screen share / animation. disableHardwareAcceleration()
+  // Performance modes — measured on private working set (real physical RAM),
+  // 2026-07-01, vs Discord's ~590MB:
+  //   Smooth (default) → no flags, full GPU. ~490MB (~17% lighter). Buttery.
+  //   Optimised        → --disable-gpu skips the GPU process (the only real
+  //                      saver): ~380MB (~36% lighter) but video / screen share /
+  //                      animation get clunkier. NB: disableHardwareAcceleration()
   //                      does NOT do this — it keeps a software-GL GPU process
-  //                      alive still allocating memory, so we use the switch.
-  //                      low-end-device-mode trims caches on top.
-  const mode = startup.perfMode || (startup.lowMemoryMode ? "Light" : "Smooth");
-  if (mode === "Light") {
+  //                      alive still allocating memory, so use the switch. We add
+  //                      low-end-device-mode too (trims caches). A "GPU-on but
+  //                      lighter" middle mode was tested and dropped — it saved no
+  //                      real RAM (can't cut it without killing the GPU process).
+  let mode = startup.perfMode || (startup.lowMemoryMode ? "Optimised" : "Smooth");
+  if (mode === "Smoothness") mode = "Smooth"; // migrate older names
+  if (mode === "Light") mode = "Optimised";
+  if (mode === "Optimised") {
     app.commandLine.appendSwitch("disable-gpu");
     app.commandLine.appendSwitch("disable-software-rasterizer");
     app.commandLine.appendSwitch("enable-low-end-device-mode");
