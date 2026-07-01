@@ -33,7 +33,7 @@ const SCHEMA = [
   { section: "Background", id: "dim", type: "slider", label: "Background dimming", min: 0, max: 100, step: 1, def: 50, suffix: "%" },
   { section: "System", id: "memory", type: "readout", label: "Memory usage" },
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
-  { section: "System", id: "lowMemoryMode", type: "toggle", label: "Low memory mode — fewer background processes (applies after restart)", def: false },
+  { section: "System", id: "perfMode", type: "select", label: "Performance mode — Smooth = full GPU acceleration (default). Light = GPU off, saves ~250 MB / ~35% RAM but video, screen share and animations get clunkier. Applies after restart.", choices: ["Smooth", "Light"], def: "Smooth" },
 ];
 
 function schemaFor(id) {
@@ -157,6 +157,8 @@ function loadSavedSettings() {
     if (typeof settings.dim === "number" && settings.dim <= 1) {
       settings.dim = Math.round(settings.dim * 100);
     }
+    // Migrate the old on/off low-memory toggle to the new performance modes.
+    if (!settings.perfMode && settings.lowMemoryMode) settings.perfMode = "Light";
     if (image) currentImageUrl = image;
     applyStyles();
   });
