@@ -269,4 +269,22 @@ async function control(action) {
   return { ok: false, error: "Spotify error " + res.status };
 }
 
-module.exports = { init, connect, disconnect, status, nowPlaying, control };
+// Jump to a position (in milliseconds) within the current track. Same
+// Premium/active-device rules as control().
+async function seek(positionMs) {
+  const token = await getAccessToken();
+  if (!token) return { ok: false, error: "not connected" };
+
+  const pos = Math.max(0, Math.round(positionMs || 0));
+  const res = await fetch(`https://api.spotify.com/v1/me/player/seek?position_ms=${pos}`, {
+    method: "PUT",
+    headers: { Authorization: "Bearer " + token },
+  });
+
+  if (res.ok || res.status === 204) return { ok: true };
+  if (res.status === 404) return { ok: false, error: "No active device." };
+  if (res.status === 403) return { ok: false, error: "Seek needs Spotify Premium." };
+  return { ok: false, error: "Spotify error " + res.status };
+}
+
+module.exports = { init, connect, disconnect, status, nowPlaying, control, seek };

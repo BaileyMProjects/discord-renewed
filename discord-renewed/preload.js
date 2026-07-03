@@ -36,6 +36,7 @@ const SCHEMA = [
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
   { section: "System", id: "perfMode", type: "select", label: "Performance mode (applies after restart). Measured RAM vs Discord's ~590 MB — Smooth: full GPU, ~490 MB (~17% lighter), buttery. Optimised: GPU off, ~380 MB (~36% lighter) but video/screen-share/animation get clunkier.", choices: ["Smooth", "Optimised"], def: "Smooth" },
   { section: "Spotify", id: "spotify", type: "spotify", label: "Spotify" },
+  { section: "Spotify", id: "dockedPlayer", type: "toggle", label: "Show a Spotify mini-player docked above your profile (pop it out with ⤢ to drag it anywhere)", def: false },
 ];
 
 function schemaFor(id) {
@@ -174,6 +175,335 @@ function syncVideoElement() {
   wrap.querySelector(".dr-video-dim").style.background = `rgba(0, 0, 0, ${dim})`;
 }
 
+// ---------------------------------------------------------------------------
+// Docked Spotify mini-player (a small, draggable now-playing card that floats
+// on the main screen, so you can see/control music without opening settings).
+// Toggled by the "dockedPlayer" setting; its position is persisted.
+// ---------------------------------------------------------------------------
+
+const DOCK_ID = "dr-docked-player"; // floating (popped-out) card
+const DOCK_INLINE_ID = "dr-dock-inline"; // docked into the sidebar above the profile
+let dockInterval = null;
+let dockBusy = false;
+let dockScrubbing = false; // true while dragging the progress bar to seek
+
+// A round control button, shared by the settings widget and the dock.
+function circleButton(glyph, title, size = 36) {
+  const b = document.createElement("button");
+  b.textContent = glyph;
+  b.title = title;
+  Object.assign(b.style, {
+    width: `${size}px`,
+    height: `${size}px`,
+    borderRadius: "50%",
+    border: "none",
+    background: "rgba(255,255,255,0.1)",
+    color: "#fff",
+    cursor: "pointer",
+    fontSize: `${Math.round(size * 0.4)}px`,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "0",
+    lineHeight: "1",
+  });
+  return b;
+}
+
+const spotifyControl = (action) => ipcRenderer.invoke("dr:spotify-control", action);
+const spotifySeek = (ms) => ipcRenderer.invoke("dr:spotify-seek", ms);
+
+// Let the dock be dragged around by its body (but not when a button is clicked),
+// clamped to the window, saving its final position so it stays put next launch.
+function makeDockDraggable(dock) {
+  let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false;
+
+  dock.addEventListener("mousedown", (e) => {
+    // Let control clicks and progress-bar seeking through without dragging the card.
+    if (e.target.closest("button") || e.target.closest("[data-dr-seek]")) return;
+    dragging = true;
+    dock.style.cursor = "grabbing";
+    startX = e.clientX;
+    startY = e.clientY;
+    const rect = dock.getBoundingClientRect();
+    origLeft = rect.left;
+    origTop = rect.top;
+    e.preventDefault();
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const nl = clamp(origLeft + (e.clientX - startX), 0, window.innerWidth - dock.offsetWidth);
+    const nt = clamp(origTop + (e.clientY - startY), 0, window.innerHeight - dock.offsetHeight);
+    dock.style.left = `${nl}px`;
+    dock.style.top = `${nt}px`;
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    dock.style.cursor = "grab";
+    const rect = dock.getBoundingClientRect();
+    settings.dockLeft = Math.round(rect.left);
+    settings.dockTop = Math.round(rect.top);
+    ipcRenderer.invoke("dr:set-setting", "dockLeft", settings.dockLeft);
+    ipcRenderer.invoke("dr:set-setting", "dockTop", settings.dockTop);
+  });
+}
+
+// Build a mini-player element. `inline` = true makes the compact version that
+// sits inside Discord's sidebar above the profile card; false makes the floating
+// draggable card. Both share the same content refs so updateDock() drives either.
+function buildDock(inline) {
+  const dock = document.createElement("div");
+  dock.id = inline ? DOCK_INLINE_ID : DOCK_ID;
+
+  if (inline) {
+    Object.assign(dock.style, {
+      boxSizing: "border-box",
+      flex: "0 0 auto", // don't let the sidebar's flex layout squash it
+      margin: "0 8px 8px",
+      padding: "8px 10px",
+      background: "rgba(0,0,0,0.22)",
+      border: "1px solid rgba(255,255,255,0.08)",
+      borderRadius: "8px",
+      color: "var(--text-normal, #dbdee1)",
+      display: "none", // shown by updateDock when there's a track
+    });
+  } else {
+    Object.assign(dock.style, {
+      position: "fixed",
+      left: `${settings.dockLeft ?? 16}px`,
+      top: `${settings.dockTop ?? Math.max(16, window.innerHeight - 170)}px`,
+      width: "300px",
+      zIndex: "9999",
+      background: "rgba(24,25,28,0.92)",
+      border: "1px solid rgba(255,255,255,0.1)",
+      borderRadius: "10px",
+      padding: "12px",
+      boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+      color: "#fff",
+      display: "none",
+      cursor: "grab",
+      userSelect: "none",
+      backdropFilter: "blur(4px)",
+    });
+  }
+
+  const artSize = inline ? 34 : 48;
+  const btnSize = inline ? 26 : 30;
+
+  const row = document.createElement("div");
+  Object.assign(row.style, { display: "flex", gap: "10px", alignItems: "center" });
+
+  const art = document.createElement("img");
+  Object.assign(art.style, { width: `${artSize}px`, height: `${artSize}px`, borderRadius: "6px", flex: "0 0 auto" });
+
+  const info = document.createElement("div");
+  Object.assign(info.style, { minWidth: "0", flex: "1 1 auto" });
+  const title = document.createElement("div");
+  Object.assign(title.style, {
+    fontWeight: "600", fontSize: inline ? "12px" : "13px", whiteSpace: "nowrap",
+    overflow: "hidden", textOverflow: "ellipsis",
+  });
+  const artist = document.createElement("div");
+  Object.assign(artist.style, {
+    fontSize: inline ? "11px" : "12px", opacity: "0.7", whiteSpace: "nowrap",
+    overflow: "hidden", textOverflow: "ellipsis",
+  });
+  info.append(title, artist);
+  row.append(art, info);
+
+  // Song progress: a thin green bar with elapsed / total times under it. The bar
+  // sits inside a taller transparent hit area (data-dr-seek) so it's easy to grab
+  // and so dragging it seeks the song instead of dragging the whole card.
+  const barTrack = document.createElement("div");
+  Object.assign(barTrack.style, {
+    height: "4px", borderRadius: "2px",
+    background: "rgba(255,255,255,0.15)", overflow: "hidden",
+  });
+  const barFill = document.createElement("div");
+  Object.assign(barFill.style, { height: "100%", width: "0%", background: "#1DB954" });
+  barTrack.appendChild(barFill);
+
+  const seekArea = document.createElement("div");
+  seekArea.dataset.drSeek = "1";
+  Object.assign(seekArea.style, {
+    marginTop: inline ? "8px" : "10px", padding: "6px 0", cursor: "pointer",
+  });
+  seekArea.appendChild(barTrack);
+
+  const times = document.createElement("div");
+  Object.assign(times.style, {
+    display: "flex", justifyContent: "space-between",
+    fontSize: "11px", opacity: "0.6", marginTop: "3px",
+  });
+  const elapsed = document.createElement("span");
+  const duration = document.createElement("span");
+  times.append(elapsed, duration);
+
+  // Click or drag the bar to seek. We preview the fill/elapsed live as you drag,
+  // then send one seek on release; dockScrubbing tells updateDock not to fight it.
+  const fracFromEvent = (e) => {
+    const rect = barTrack.getBoundingClientRect();
+    return clamp((e.clientX - rect.left) / rect.width, 0, 1);
+  };
+  const previewFrac = (f) => {
+    barFill.style.width = `${f * 100}%`;
+    elapsed.textContent = msToClock(f * (dock._durationMs || 0));
+  };
+  let scrubFrac = null;
+  seekArea.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    dockScrubbing = true;
+    seekArea.setPointerCapture(e.pointerId);
+    scrubFrac = fracFromEvent(e);
+    previewFrac(scrubFrac);
+  });
+  seekArea.addEventListener("pointermove", (e) => {
+    if (!dockScrubbing) return;
+    scrubFrac = fracFromEvent(e);
+    previewFrac(scrubFrac);
+  });
+  const endScrub = () => {
+    if (!dockScrubbing) return;
+    dockScrubbing = false;
+    const dur = dock._durationMs || 0;
+    if (dur && scrubFrac != null) {
+      spotifySeek(Math.round(scrubFrac * dur)).then(() => setTimeout(pollDock, 350));
+    }
+    scrubFrac = null;
+  };
+  seekArea.addEventListener("pointerup", endScrub);
+  seekArea.addEventListener("pointercancel", endScrub);
+
+  const ctl = document.createElement("div");
+  Object.assign(ctl.style, {
+    display: "flex", gap: "8px", alignItems: "center",
+    justifyContent: inline ? "flex-start" : "center", marginTop: inline ? "8px" : "10px",
+  });
+  const prev = circleButton("⏮", "Previous", btnSize);
+  const play = circleButton("▶", "Play / Pause", btnSize);
+  const next = circleButton("⏭", "Next", btnSize);
+
+  // Mode button: docked → pop out into a floating card; floating → dock back.
+  const modeBtn = inline
+    ? circleButton("⤢", "Pop out (drag anywhere)", btnSize)
+    : circleButton("⤓", "Dock to sidebar", btnSize);
+  modeBtn.style.marginLeft = "auto"; // push to the far end of the row
+  modeBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setSetting("dockMode", inline ? "floating" : "docked");
+  });
+
+  ctl.append(prev, play, next, modeBtn);
+
+  const afterAction = () => setTimeout(pollDock, 350);
+  prev.addEventListener("click", () => { spotifyControl("previous").then(afterAction); });
+  next.addEventListener("click", () => { spotifyControl("next").then(afterAction); });
+  play.addEventListener("click", () => {
+    spotifyControl(play.dataset.playing === "1" ? "pause" : "play").then(afterAction);
+  });
+
+  dock.append(row, seekArea, times, ctl);
+  dock._refs = { art, title, artist, play, barFill, elapsed, duration };
+  if (!inline) makeDockDraggable(dock);
+  return dock;
+}
+
+// Paint a mini-player from a nowPlaying() result; hide it when there's no track.
+function updateDock(dock, data) {
+  const r = dock._refs;
+  if (!data || !data.connected || !data.track) {
+    dock.style.display = "none";
+    return;
+  }
+  dock.style.display = "block";
+  if (data.art) {
+    r.art.src = data.art;
+    r.art.style.display = "block";
+  } else {
+    r.art.style.display = "none";
+  }
+  r.title.textContent = data.track;
+  r.artist.textContent = data.artists || "";
+  dock._durationMs = data.durationMs || 0;
+  r.duration.textContent = msToClock(data.durationMs);
+  // Don't overwrite the bar/elapsed while the user is dragging it to seek.
+  if (!dockScrubbing) {
+    const pct = data.durationMs ? Math.min(100, (data.progressMs / data.durationMs) * 100) : 0;
+    r.barFill.style.width = `${pct}%`;
+    r.elapsed.textContent = msToClock(data.progressMs);
+  }
+  const playing = Boolean(data.playing);
+  r.play.dataset.playing = playing ? "1" : "0";
+  r.play.textContent = playing ? "⏸" : "▶";
+}
+
+// The single active mini-player element, whichever mode we're in.
+function currentDock() {
+  return document.getElementById(DOCK_ID) || document.getElementById(DOCK_INLINE_ID);
+}
+
+function pollDock() {
+  const dock = currentDock();
+  if (!dock || dockBusy) return;
+  dockBusy = true;
+  ipcRenderer
+    .invoke("dr:spotify-now-playing")
+    .then((data) => updateDock(dock, data))
+    .finally(() => (dockBusy = false));
+}
+
+// Insert the docked (inline) mini-player just above Discord's profile card. That
+// card lives at the bottom of the left sidebar; inserting before it makes the
+// channel list flex to leave room, so it reads as part of the app.
+function injectInlineDock() {
+  if (document.getElementById(DOCK_INLINE_ID)) return;
+  const panels = document.querySelector('[class*="panels_"]');
+  if (!panels || !panels.parentElement) return; // sidebar not on screen yet
+  panels.parentElement.insertBefore(buildDock(true), panels);
+}
+
+// Create/remove the mini-player (in whichever mode) and its polling timer to
+// match the settings. Called from applyStyles, so it re-syncs on any change.
+function syncDockedPlayer() {
+  const enabled = Boolean(val("dockedPlayer"));
+
+  if (!enabled) {
+    document.getElementById(DOCK_ID)?.remove();
+    document.getElementById(DOCK_INLINE_ID)?.remove();
+    if (dockInterval) {
+      clearInterval(dockInterval);
+      dockInterval = null;
+    }
+    return;
+  }
+
+  if ((val("dockMode") || "docked") === "floating") {
+    document.getElementById(DOCK_INLINE_ID)?.remove();
+    if (!document.getElementById(DOCK_ID)) {
+      (document.body || document.documentElement).appendChild(buildDock(false));
+    }
+  } else {
+    document.getElementById(DOCK_ID)?.remove();
+    injectInlineDock();
+  }
+
+  if (!dockInterval) dockInterval = setInterval(pollDock, 3000);
+  pollDock();
+}
+
+// Discord re-renders its sidebar constantly, which can wipe out our inline dock.
+// Called from the MutationObserver to re-insert it (cheaply) if it went missing.
+function ensureDockPresent() {
+  if (!Boolean(val("dockedPlayer"))) return;
+  if ((val("dockMode") || "docked") !== "docked") return;
+  if (document.getElementById(DOCK_INLINE_ID)) return;
+  injectInlineDock();
+  if (document.getElementById(DOCK_INLINE_ID)) pollDock(); // refresh once after re-insert
+}
+
 // Combine every section's CSS. Future sections (theme, fonts, custom CSS) get
 // appended here.
 function buildCss() {
@@ -185,6 +515,7 @@ function applyStyles() {
   // then rebuild the CSS. Every place that changes a setting calls this, so the
   // video element and dimming overlay update alongside the styles.
   syncVideoElement();
+  syncDockedPlayer();
 
   let style = document.getElementById(STYLE_ID);
   const css = buildCss();
@@ -300,94 +631,9 @@ const msToClock = (ms) => {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 };
 
-// Paint the "now playing" area from a nowPlaying() result. Shows album art +
-// track + artist + a progress bar when something's playing, an idle note when
-// connected but paused, and nothing when disconnected.
-function renderNowPlaying(np, data) {
-  np.innerHTML = "";
-  if (!data || !data.connected) {
-    np.style.display = "none";
-    return;
-  }
-  np.style.display = "block";
-
-  if (!data.playing || !data.track) {
-    const idle = document.createElement("div");
-    Object.assign(idle.style, { fontSize: "13px", opacity: "0.6" });
-    idle.textContent = "Nothing playing right now.";
-    np.appendChild(idle);
-    return;
-  }
-
-  const row = document.createElement("div");
-  Object.assign(row.style, { display: "flex", gap: "12px", alignItems: "center" });
-
-  if (data.art) {
-    const img = document.createElement("img");
-    img.src = data.art;
-    Object.assign(img.style, { width: "56px", height: "56px", borderRadius: "6px", flex: "0 0 auto" });
-    row.appendChild(img);
-  }
-
-  const info = document.createElement("div");
-  Object.assign(info.style, { minWidth: "0", flex: "1 1 auto" });
-
-  const title = document.createElement("div");
-  Object.assign(title.style, {
-    fontWeight: "600",
-    fontSize: "14px",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    color: "var(--header-primary, #f2f3f5)",
-  });
-  title.textContent = data.track;
-
-  const artist = document.createElement("div");
-  Object.assign(artist.style, {
-    fontSize: "13px",
-    opacity: "0.7",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-  });
-  artist.textContent = data.artists || "";
-
-  // Thin progress bar with elapsed / total times.
-  const barTrack = document.createElement("div");
-  Object.assign(barTrack.style, {
-    marginTop: "8px",
-    height: "4px",
-    borderRadius: "2px",
-    background: "rgba(255,255,255,0.15)",
-    overflow: "hidden",
-  });
-  const barFill = document.createElement("div");
-  const pct = data.durationMs ? Math.min(100, (data.progressMs / data.durationMs) * 100) : 0;
-  Object.assign(barFill.style, { height: "100%", width: `${pct}%`, background: "#1DB954" });
-  barTrack.appendChild(barFill);
-
-  const times = document.createElement("div");
-  Object.assign(times.style, {
-    display: "flex",
-    justifyContent: "space-between",
-    fontSize: "11px",
-    opacity: "0.6",
-    marginTop: "4px",
-  });
-  const elapsed = document.createElement("span");
-  elapsed.textContent = msToClock(data.progressMs);
-  const duration = document.createElement("span");
-  duration.textContent = msToClock(data.durationMs);
-  times.append(elapsed, duration);
-
-  info.append(title, artist, barTrack, times);
-  row.appendChild(info);
-  np.appendChild(row);
-}
-
-// Build the Spotify control: a live "now playing" readout, a status line, and a
-// Connect/Disconnect button.
+// Build the Spotify control for the SETTINGS page: connection status + a
+// Connect/Disconnect button. The live now-playing readout and playback controls
+// live in the docked mini-player (see buildDock), so settings only holds options.
 function renderSpotify(wrap) {
   wrap.appendChild(controlLabel("Spotify"));
 
@@ -400,79 +646,10 @@ function renderSpotify(wrap) {
     color: "var(--text-normal, #dbdee1)",
   });
 
-  const nowPlaying = document.createElement("div");
-  Object.assign(nowPlaying.style, { marginBottom: "14px", display: "none" });
-
-  // Playback controls (prev / play-pause / next). Kept as a persistent row so
-  // they don't flicker when the now-playing area rebuilds every poll. Only shown
-  // while connected; the play/pause glyph is refreshed from each poll's state.
-  const controls = document.createElement("div");
-  Object.assign(controls.style, { display: "none", alignItems: "center", gap: "8px", marginBottom: "14px" });
-
-  const makeCircleBtn = (glyph, title) => {
-    const b = document.createElement("button");
-    b.textContent = glyph;
-    b.title = title;
-    Object.assign(b.style, {
-      width: "36px",
-      height: "36px",
-      borderRadius: "50%",
-      border: "none",
-      background: "rgba(255,255,255,0.1)",
-      color: "#fff",
-      cursor: "pointer",
-      fontSize: "14px",
-    });
-    return b;
-  };
-  const prevBtn = makeCircleBtn("⏮", "Previous");
-  const playBtn = makeCircleBtn("▶", "Play / Pause");
-  const nextBtn = makeCircleBtn("⏭", "Next");
-  const ctlError = document.createElement("span");
-  Object.assign(ctlError.style, { fontSize: "12px", opacity: "0.75", marginLeft: "4px" });
-  controls.append(prevBtn, playBtn, nextBtn, ctlError);
-
-  async function doControl(action) {
-    ctlError.textContent = "";
-    const r = await ipcRenderer.invoke("dr:spotify-control", action);
-    if (r && !r.ok) ctlError.textContent = r.error || "failed";
-    setTimeout(pollNowPlaying, 350); // give Spotify a moment, then refresh
-  }
-  prevBtn.addEventListener("click", () => doControl("previous"));
-  nextBtn.addEventListener("click", () => doControl("next"));
-  playBtn.addEventListener("click", () => doControl(playBtn.dataset.playing === "1" ? "pause" : "play"));
-
-  // Show/hide controls and flip the play/pause glyph from a poll result.
-  function updateControls(data) {
-    if (data && data.connected) {
-      controls.style.display = "flex";
-      const playing = Boolean(data.playing);
-      playBtn.dataset.playing = playing ? "1" : "0";
-      playBtn.textContent = playing ? "⏸" : "▶";
-    } else {
-      controls.style.display = "none";
-      ctlError.textContent = "";
-    }
-  }
-
   const statusLine = document.createElement("div");
   Object.assign(statusLine.style, { fontSize: "14px", marginBottom: "12px" });
 
   const btn = makeButton("Connect Spotify", "#1DB954"); // Spotify green
-
-  // Poll what's playing; only meaningful while connected (returns fast otherwise).
-  let busy = false;
-  const pollNowPlaying = () => {
-    if (busy) return;
-    busy = true;
-    ipcRenderer
-      .invoke("dr:spotify-now-playing")
-      .then((data) => {
-        renderNowPlaying(nowPlaying, data);
-        updateControls(data);
-      })
-      .finally(() => (busy = false));
-  };
 
   // Paint the box for a given status object { connected, name }.
   function render(status) {
@@ -480,13 +657,10 @@ function renderSpotify(wrap) {
       statusLine.textContent = status.name ? `Connected as ${status.name} ✓` : "Connected ✓";
       btn.textContent = "Disconnect";
       btn.style.background = "#4e5058";
-      pollNowPlaying();
     } else {
       statusLine.textContent = status && status.error ? `Not connected — ${status.error}` : "Not connected.";
       btn.textContent = "Connect Spotify";
       btn.style.background = "#1DB954";
-      renderNowPlaying(nowPlaying, null);
-      updateControls(null);
     }
     btn.disabled = false;
   }
@@ -502,13 +676,10 @@ function renderSpotify(wrap) {
     }
   });
 
-  box.append(nowPlaying, controls, statusLine, btn);
+  box.append(statusLine, btn);
   wrap.appendChild(box);
 
-  // Show current connection state right away, then keep the track info fresh
-  // while the settings page is open (cleared in hidePage, like the RAM meter).
   ipcRenderer.invoke("dr:spotify-status").then(render);
-  pageIntervals.push(setInterval(pollNowPlaying, 3000));
   return wrap;
 }
 
@@ -848,7 +1019,10 @@ function injectSettings() {
 
 // Discord re-renders constantly and the settings screen only exists while open,
 // so we re-check on every DOM change and re-inject as needed.
-const observer = new MutationObserver(() => injectSettings());
+const observer = new MutationObserver(() => {
+  injectSettings();
+  ensureDockPresent();
+});
 window.addEventListener("DOMContentLoaded", () => {
   observer.observe(document.documentElement, { childList: true, subtree: true });
   injectSettings();
