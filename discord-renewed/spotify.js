@@ -237,4 +237,36 @@ async function nowPlaying() {
   };
 }
 
-module.exports = { init, connect, disconnect, status, nowPlaying };
+// ---------------------------------------------------------------------------
+// Playback controls (play / pause / next / previous)
+// ---------------------------------------------------------------------------
+
+// Send a transport command to whatever device is currently active on the
+// account. Returns { ok } or { ok:false, error } with a human-readable reason.
+// NOTE: Spotify only allows API playback control on PREMIUM accounts and only
+// when a device is actively playing — hence the 403 / 404 messages below.
+async function control(action) {
+  const token = await getAccessToken();
+  if (!token) return { ok: false, error: "not connected" };
+
+  const map = {
+    play: { method: "PUT", path: "play" },
+    pause: { method: "PUT", path: "pause" },
+    next: { method: "POST", path: "next" },
+    previous: { method: "POST", path: "previous" },
+  };
+  const m = map[action];
+  if (!m) return { ok: false, error: "unknown action" };
+
+  const res = await fetch(`https://api.spotify.com/v1/me/player/${m.path}`, {
+    method: m.method,
+    headers: { Authorization: "Bearer " + token },
+  });
+
+  if (res.ok || res.status === 204) return { ok: true };
+  if (res.status === 404) return { ok: false, error: "No active device — start playing on Spotify first." };
+  if (res.status === 403) return { ok: false, error: "Control needs Spotify Premium." };
+  return { ok: false, error: "Spotify error " + res.status };
+}
+
+module.exports = { init, connect, disconnect, status, nowPlaying, control };

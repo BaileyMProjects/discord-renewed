@@ -403,6 +403,58 @@ function renderSpotify(wrap) {
   const nowPlaying = document.createElement("div");
   Object.assign(nowPlaying.style, { marginBottom: "14px", display: "none" });
 
+  // Playback controls (prev / play-pause / next). Kept as a persistent row so
+  // they don't flicker when the now-playing area rebuilds every poll. Only shown
+  // while connected; the play/pause glyph is refreshed from each poll's state.
+  const controls = document.createElement("div");
+  Object.assign(controls.style, { display: "none", alignItems: "center", gap: "8px", marginBottom: "14px" });
+
+  const makeCircleBtn = (glyph, title) => {
+    const b = document.createElement("button");
+    b.textContent = glyph;
+    b.title = title;
+    Object.assign(b.style, {
+      width: "36px",
+      height: "36px",
+      borderRadius: "50%",
+      border: "none",
+      background: "rgba(255,255,255,0.1)",
+      color: "#fff",
+      cursor: "pointer",
+      fontSize: "14px",
+    });
+    return b;
+  };
+  const prevBtn = makeCircleBtn("⏮", "Previous");
+  const playBtn = makeCircleBtn("▶", "Play / Pause");
+  const nextBtn = makeCircleBtn("⏭", "Next");
+  const ctlError = document.createElement("span");
+  Object.assign(ctlError.style, { fontSize: "12px", opacity: "0.75", marginLeft: "4px" });
+  controls.append(prevBtn, playBtn, nextBtn, ctlError);
+
+  async function doControl(action) {
+    ctlError.textContent = "";
+    const r = await ipcRenderer.invoke("dr:spotify-control", action);
+    if (r && !r.ok) ctlError.textContent = r.error || "failed";
+    setTimeout(pollNowPlaying, 350); // give Spotify a moment, then refresh
+  }
+  prevBtn.addEventListener("click", () => doControl("previous"));
+  nextBtn.addEventListener("click", () => doControl("next"));
+  playBtn.addEventListener("click", () => doControl(playBtn.dataset.playing === "1" ? "pause" : "play"));
+
+  // Show/hide controls and flip the play/pause glyph from a poll result.
+  function updateControls(data) {
+    if (data && data.connected) {
+      controls.style.display = "flex";
+      const playing = Boolean(data.playing);
+      playBtn.dataset.playing = playing ? "1" : "0";
+      playBtn.textContent = playing ? "⏸" : "▶";
+    } else {
+      controls.style.display = "none";
+      ctlError.textContent = "";
+    }
+  }
+
   const statusLine = document.createElement("div");
   Object.assign(statusLine.style, { fontSize: "14px", marginBottom: "12px" });
 
@@ -415,7 +467,10 @@ function renderSpotify(wrap) {
     busy = true;
     ipcRenderer
       .invoke("dr:spotify-now-playing")
-      .then((data) => renderNowPlaying(nowPlaying, data))
+      .then((data) => {
+        renderNowPlaying(nowPlaying, data);
+        updateControls(data);
+      })
       .finally(() => (busy = false));
   };
 
@@ -431,6 +486,7 @@ function renderSpotify(wrap) {
       btn.textContent = "Connect Spotify";
       btn.style.background = "#1DB954";
       renderNowPlaying(nowPlaying, null);
+      updateControls(null);
     }
     btn.disabled = false;
   }
@@ -446,7 +502,7 @@ function renderSpotify(wrap) {
     }
   });
 
-  box.append(nowPlaying, statusLine, btn);
+  box.append(nowPlaying, controls, statusLine, btn);
   wrap.appendChild(box);
 
   // Show current connection state right away, then keep the track info fresh

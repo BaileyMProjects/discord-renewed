@@ -274,6 +274,8 @@ ipcMain.handle("dr:spotify-disconnect", () => {
 
 ipcMain.handle("dr:spotify-now-playing", () => spotify.nowPlaying());
 
+ipcMain.handle("dr:spotify-control", (_event, action) => spotify.control(action));
+
 // Discord sends a strict Content-Security-Policy that would block the styles
 // and images we inject. Because we own this desktop shell, we strip that
 // header from Discord's responses. Trade-off: this lowers the page's built-in
