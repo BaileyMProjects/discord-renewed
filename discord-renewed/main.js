@@ -8,6 +8,7 @@ const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
 const { pathToFileURL } = require("url");
+const spotify = require("./spotify");
 
 // Register a private URL scheme we use to stream background VIDEOS straight
 // from disk. Images are small enough to hand to the page as base64 data URLs,
@@ -247,6 +248,31 @@ ipcMain.handle("dr:remove-background", () => {
     writeSettings(s);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Spotify integration (the OAuth flow + API live in spotify.js). We give that
+// module our persistent-store helpers so it can save/read tokens like any other
+// setting, then expose its actions to the settings page over IPC.
+// ---------------------------------------------------------------------------
+spotify.init({ read: readSettings, write: writeSettings });
+
+ipcMain.handle("dr:spotify-status", () => spotify.status());
+
+ipcMain.handle("dr:spotify-connect", async () => {
+  try {
+    return await spotify.connect();
+  } catch (err) {
+    console.error("[DiscordRenewed] Spotify connect failed:", err.message);
+    return { connected: false, error: err.message };
+  }
+});
+
+ipcMain.handle("dr:spotify-disconnect", () => {
+  spotify.disconnect();
+  return { connected: false };
+});
+
+ipcMain.handle("dr:spotify-now-playing", () => spotify.nowPlaying());
 
 // Discord sends a strict Content-Security-Policy that would block the styles
 // and images we inject. Because we own this desktop shell, we strip that

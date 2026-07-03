@@ -35,6 +35,7 @@ const SCHEMA = [
   { section: "System", id: "memory", type: "readout", label: "Memory usage" },
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
   { section: "System", id: "perfMode", type: "select", label: "Performance mode (applies after restart). Measured RAM vs Discord's ~590 MB — Smooth: full GPU, ~490 MB (~17% lighter), buttery. Optimised: GPU off, ~380 MB (~36% lighter) but video/screen-share/animation get clunkier.", choices: ["Smooth", "Optimised"], def: "Smooth" },
+  { section: "Spotify", id: "spotify", type: "spotify", label: "Spotify" },
 ];
 
 function schemaFor(id) {
@@ -294,6 +295,167 @@ function renderMetrics(box, m) {
   box.append(total, sub);
 }
 
+const msToClock = (ms) => {
+  const total = Math.floor((ms || 0) / 1000);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+};
+
+// Paint the "now playing" area from a nowPlaying() result. Shows album art +
+// track + artist + a progress bar when something's playing, an idle note when
+// connected but paused, and nothing when disconnected.
+function renderNowPlaying(np, data) {
+  np.innerHTML = "";
+  if (!data || !data.connected) {
+    np.style.display = "none";
+    return;
+  }
+  np.style.display = "block";
+
+  if (!data.playing || !data.track) {
+    const idle = document.createElement("div");
+    Object.assign(idle.style, { fontSize: "13px", opacity: "0.6" });
+    idle.textContent = "Nothing playing right now.";
+    np.appendChild(idle);
+    return;
+  }
+
+  const row = document.createElement("div");
+  Object.assign(row.style, { display: "flex", gap: "12px", alignItems: "center" });
+
+  if (data.art) {
+    const img = document.createElement("img");
+    img.src = data.art;
+    Object.assign(img.style, { width: "56px", height: "56px", borderRadius: "6px", flex: "0 0 auto" });
+    row.appendChild(img);
+  }
+
+  const info = document.createElement("div");
+  Object.assign(info.style, { minWidth: "0", flex: "1 1 auto" });
+
+  const title = document.createElement("div");
+  Object.assign(title.style, {
+    fontWeight: "600",
+    fontSize: "14px",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    color: "var(--header-primary, #f2f3f5)",
+  });
+  title.textContent = data.track;
+
+  const artist = document.createElement("div");
+  Object.assign(artist.style, {
+    fontSize: "13px",
+    opacity: "0.7",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  });
+  artist.textContent = data.artists || "";
+
+  // Thin progress bar with elapsed / total times.
+  const barTrack = document.createElement("div");
+  Object.assign(barTrack.style, {
+    marginTop: "8px",
+    height: "4px",
+    borderRadius: "2px",
+    background: "rgba(255,255,255,0.15)",
+    overflow: "hidden",
+  });
+  const barFill = document.createElement("div");
+  const pct = data.durationMs ? Math.min(100, (data.progressMs / data.durationMs) * 100) : 0;
+  Object.assign(barFill.style, { height: "100%", width: `${pct}%`, background: "#1DB954" });
+  barTrack.appendChild(barFill);
+
+  const times = document.createElement("div");
+  Object.assign(times.style, {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: "11px",
+    opacity: "0.6",
+    marginTop: "4px",
+  });
+  const elapsed = document.createElement("span");
+  elapsed.textContent = msToClock(data.progressMs);
+  const duration = document.createElement("span");
+  duration.textContent = msToClock(data.durationMs);
+  times.append(elapsed, duration);
+
+  info.append(title, artist, barTrack, times);
+  row.appendChild(info);
+  np.appendChild(row);
+}
+
+// Build the Spotify control: a live "now playing" readout, a status line, and a
+// Connect/Disconnect button.
+function renderSpotify(wrap) {
+  wrap.appendChild(controlLabel("Spotify"));
+
+  const box = document.createElement("div");
+  Object.assign(box.style, {
+    padding: "16px",
+    borderRadius: "8px",
+    background: "rgba(0, 0, 0, 0.25)",
+    border: "1px solid rgba(255, 255, 255, 0.08)",
+    color: "var(--text-normal, #dbdee1)",
+  });
+
+  const nowPlaying = document.createElement("div");
+  Object.assign(nowPlaying.style, { marginBottom: "14px", display: "none" });
+
+  const statusLine = document.createElement("div");
+  Object.assign(statusLine.style, { fontSize: "14px", marginBottom: "12px" });
+
+  const btn = makeButton("Connect Spotify", "#1DB954"); // Spotify green
+
+  // Poll what's playing; only meaningful while connected (returns fast otherwise).
+  let busy = false;
+  const pollNowPlaying = () => {
+    if (busy) return;
+    busy = true;
+    ipcRenderer
+      .invoke("dr:spotify-now-playing")
+      .then((data) => renderNowPlaying(nowPlaying, data))
+      .finally(() => (busy = false));
+  };
+
+  // Paint the box for a given status object { connected, name }.
+  function render(status) {
+    if (status && status.connected) {
+      statusLine.textContent = status.name ? `Connected as ${status.name} ✓` : "Connected ✓";
+      btn.textContent = "Disconnect";
+      btn.style.background = "#4e5058";
+      pollNowPlaying();
+    } else {
+      statusLine.textContent = status && status.error ? `Not connected — ${status.error}` : "Not connected.";
+      btn.textContent = "Connect Spotify";
+      btn.style.background = "#1DB954";
+      renderNowPlaying(nowPlaying, null);
+    }
+    btn.disabled = false;
+  }
+
+  btn.addEventListener("click", async () => {
+    const connected = btn.textContent === "Disconnect";
+    btn.disabled = true;
+    if (connected) {
+      render(await ipcRenderer.invoke("dr:spotify-disconnect"));
+    } else {
+      btn.textContent = "Connecting… approve in your browser";
+      render(await ipcRenderer.invoke("dr:spotify-connect"));
+    }
+  });
+
+  box.append(nowPlaying, statusLine, btn);
+  wrap.appendChild(box);
+
+  // Show current connection state right away, then keep the track info fresh
+  // while the settings page is open (cleared in hidePage, like the RAM meter).
+  ipcRenderer.invoke("dr:spotify-status").then(render);
+  pageIntervals.push(setInterval(pollNowPlaying, 3000));
+  return wrap;
+}
+
 // Handle a button control's action, with brief visual feedback on the button.
 function runButtonAction(action, btn) {
   if (action === "clear-cache") {
@@ -410,6 +572,10 @@ function renderControl(ctrl) {
     b.addEventListener("click", () => runButtonAction(ctrl.action, b));
     wrap.appendChild(b);
     return wrap;
+  }
+
+  if (ctrl.type === "spotify") {
+    return renderSpotify(wrap);
   }
 
   if (ctrl.type === "select") {
