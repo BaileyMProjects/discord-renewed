@@ -571,11 +571,12 @@ function injectInlineDock() {
   document.documentElement.appendChild(buildDock(true));
 }
 
-// The left column that holds the search box + nav + DM/channel list. It's
-// `privateChannels_` in the Home/DMs view and `sidebar_` inside a server (never
-// the settings `sidebar__`). Padding the top of this pushes its own content down.
-const SIDEBAR_SELECTOR =
-  '[class*="privateChannels_"], [class*="sidebar_"]:not([class*="sidebar__"])';
+// The left column that holds the search box + nav + DM/channel list. In both the
+// Home/DMs view and inside a server it's a <nav> wrapped by `sidebarList__`
+// (the inner nav's own class differs per view — privateChannels_ vs a generic
+// container__ — so we anchor on the stable wrapper). Padding its top pushes the
+// column's own content down below the docked player.
+const SIDEBAR_SELECTOR = '[class*="sidebarList"] > nav';
 
 // Reserve vertical space at the top of the left sidebar column so the docked
 // player floats there WITHOUT covering the search box / nav — Discord's content
