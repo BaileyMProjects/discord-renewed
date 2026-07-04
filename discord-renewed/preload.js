@@ -24,6 +24,7 @@ const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
 let settings = {}; // all saved customization values, keyed by schema id
 let currentBackground = null; // { type: "image"|"video", url } or null
+let currentTabImage = null; // { type: "image", url } or null — mini-player bg image
 
 // ---------------------------------------------------------------------------
 // Customization schema — add entries here to add options.
@@ -39,6 +40,8 @@ const SCHEMA = [
   { section: "Spotify", id: "dockedPlayer", type: "toggle", label: "Show a Spotify mini-player docked above your profile (pop it out with ⤢ to drag it anywhere)", def: false },
   { section: "Spotify", id: "tabColor", type: "color", label: "Mini-player background colour", def: "", defColor: "#1e1f22" },
   { section: "Spotify", id: "tabLineColor", type: "color", label: "Progress bar colour", def: "", defColor: "#1DB954" },
+  { section: "Spotify", id: "tabImage", type: "tabImage", label: "Mini-player background image" },
+  { section: "Spotify", id: "tabDim", type: "slider", label: "Mini-player image dimming", min: 0, max: 100, step: 1, def: 0, suffix: "%" },
 ];
 
 function schemaFor(id) {
@@ -219,6 +222,14 @@ const spotifySeek = (ms) => ipcRenderer.invoke("dr:spotify-seek", ms);
 // built-in look (a subtle fill inline, a solid frosted card when floating).
 function dockBgFor(inline) {
   const color = val("tabColor");
+  if (currentTabImage && currentTabImage.url) {
+    // Dimming overlay on top, image, then the chosen colour (or a solid fallback)
+    // behind it for any gaps.
+    const behind = color || (inline ? "#000" : "#18191c");
+    const dim = clamp(Number(val("tabDim")) || 0, 0, 100) / 100;
+    const dimC = `rgba(0,0,0,${dim})`;
+    return `linear-gradient(${dimC}, ${dimC}), url("${currentTabImage.url}") center/cover no-repeat, ${behind}`;
+  }
   if (color) return color;
   return inline ? "rgba(0,0,0,0.22)" : "rgba(24,25,28,0.92)";
 }
@@ -580,8 +591,9 @@ function removeBackgroundImage() {
 function loadSavedSettings() {
   ipcRenderer.invoke("dr:get-settings").then((s) => {
     if (!s) return;
-    const { background, backgroundFile, backgroundType, image, ...values } = s;
+    const { background, backgroundFile, backgroundType, image, tabImage, tabImageFile, ...values } = s;
     settings = values;
+    if (tabImage) currentTabImage = tabImage;
     // Migrate an older 0–1 dim value to the 0–100 slider scale.
     if (typeof settings.dim === "number" && settings.dim <= 1) {
       settings.dim = Math.round(settings.dim * 100);
@@ -868,6 +880,32 @@ function renderControl(ctrl) {
 
     rowc.append(swatch, reset);
     wrap.appendChild(rowc);
+    return wrap;
+  }
+
+  if (ctrl.type === "tabImage") {
+    wrap.appendChild(controlLabel(ctrl.label));
+    const pick = makeButton("Choose image…", "#5865F2");
+    pick.addEventListener("click", async () => {
+      const res = await ipcRenderer.invoke("dr:pick-tab-image");
+      if (res) {
+        currentTabImage = res;
+        applyStyles();
+      }
+    });
+    const remove = makeButton("Remove", "#4e5058");
+    remove.style.marginLeft = "10px";
+    remove.addEventListener("click", () => {
+      currentTabImage = null;
+      applyStyles();
+      ipcRenderer.invoke("dr:remove-tab-image");
+    });
+    wrap.append(pick, remove);
+
+    const hint = document.createElement("div");
+    hint.textContent = "An image covers the mini-player background (overrides the colour above).";
+    Object.assign(hint.style, { marginTop: "10px", fontSize: "12px", opacity: "0.6" });
+    wrap.appendChild(hint);
     return wrap;
   }
 

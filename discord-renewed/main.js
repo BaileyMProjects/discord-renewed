@@ -123,14 +123,14 @@ function writeSettings(settings) {
 // Images come back as a base64 data URL; videos come back as a dr-media:// URL
 // that the page's <video> element streams (with a cache-busting "?v=<mtime>" so
 // replacing the file actually reloads it). Returns { type, url } or null.
-function backgroundResource(settings) {
-  if (!settings.backgroundFile) return null;
-  const p = path.join(settingsDir(), settings.backgroundFile);
+function resourceForFile(fileName) {
+  if (!fileName) return null;
+  const p = path.join(settingsDir(), fileName);
   const ext = path.extname(p).slice(1).toLowerCase();
   try {
     if (VIDEO_MIME[ext]) {
       const mtime = Math.round(fs.statSync(p).mtimeMs);
-      return { type: "video", url: `dr-media://media/${settings.backgroundFile}?v=${mtime}` };
+      return { type: "video", url: `dr-media://media/${fileName}?v=${mtime}` };
     }
     const mime = IMAGE_MIME[ext] || "application/octet-stream";
     return { type: "image", url: `data:${mime};base64,${fs.readFileSync(p).toString("base64")}` };
@@ -139,11 +139,16 @@ function backgroundResource(settings) {
   }
 }
 
+// The saved main background (image or video) as a { type, url } resource.
+function backgroundResource(settings) {
+  return resourceForFile(settings.backgroundFile);
+}
+
 // On startup the preload asks for the saved settings so it can re-apply them.
 // Returns every saved setting plus the background as a { type, url } resource.
 ipcMain.handle("dr:get-settings", () => {
   const s = readSettings();
-  return { ...s, background: backgroundResource(s) };
+  return { ...s, background: backgroundResource(s), tabImage: resourceForFile(s.tabImageFile) };
 });
 
 // Generic setter: persist any customization value by key.
@@ -189,6 +194,46 @@ ipcMain.handle("dr:pick-background", async () => {
   writeSettings(s);
 
   return backgroundResource(s);
+});
+
+// Pick / copy an image to use as the Spotify mini-player's background. Stored the
+// same way as the main background (copied into the app data folder) but under its
+// own key so the two never collide.
+ipcMain.handle("dr:pick-tab-image", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "Choose a mini-player background image",
+    properties: ["openFile"],
+    filters: [{ name: "Images", extensions: Object.keys(IMAGE_MIME) }],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+
+  const src = result.filePaths[0];
+  const ext = path.extname(src).slice(1).toLowerCase();
+  const destName = `tabimage.${ext}`;
+  const dest = path.join(settingsDir(), destName);
+  fs.copyFileSync(src, dest);
+
+  const s = readSettings();
+  if (s.tabImageFile && s.tabImageFile !== destName) {
+    try {
+      fs.unlinkSync(path.join(settingsDir(), s.tabImageFile));
+    } catch {}
+  }
+  s.tabImageFile = destName;
+  writeSettings(s);
+
+  return resourceForFile(destName);
+});
+
+ipcMain.handle("dr:remove-tab-image", () => {
+  const s = readSettings();
+  if (s.tabImageFile) {
+    try {
+      fs.unlinkSync(path.join(settingsDir(), s.tabImageFile));
+    } catch {}
+    delete s.tabImageFile;
+    writeSettings(s);
+  }
 });
 
 // Report the real RAM the app is using = the summed PRIVATE working set across
