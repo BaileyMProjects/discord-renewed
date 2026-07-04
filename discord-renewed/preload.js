@@ -207,29 +207,61 @@ function syncVideoElement() {
 
 const DOCK_ID = "dr-docked-player"; // floating (popped-out) card
 const DOCK_INLINE_ID = "dr-dock-inline"; // docked into the sidebar above the profile
+const DOCK_RESERVE_ID = "dr-dock-reserve"; // <style> that pushes sidebar content below the docked player
 let dockInterval = null;
 let dockBusy = false;
 let dockScrubbing = false; // true while dragging the progress bar to seek
+let dockInlineReserve = 0; // px of sidebar top space currently reserved for the docked player
 
-// A round control button, shared by the settings widget and the dock.
-function circleButton(glyph, title, size = 36) {
+// Crisp media-control icons (SVG). Filled transport glyphs render more cleanly
+// and consistently than the ⏮ ▶ ⏭ text characters, and ⤢/⤓ text was ambiguous
+// (looked like a download arrow), so pop-out/dock get proper expand/collapse icons.
+const ICONS = {
+  prev: '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zM20 6v12L9.5 12z"/></svg>',
+  next: '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M16 6h2v12h-2zM4 6l10.5 6L4 18z"/></svg>',
+  play: '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>',
+  pause: '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>',
+  popout: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+  dock: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+};
+
+// A round control button, shared by the settings widget and the dock. `icon` may
+// be an SVG string (rendered as-is) or a text glyph. `opts.primary` gives the
+// filled-white "main action" look (used for play/pause), matching Spotify.
+function circleButton(icon, title, size = 36, opts = {}) {
   const b = document.createElement("button");
-  b.textContent = glyph;
+  const isSvg = typeof icon === "string" && icon.trim().startsWith("<");
+  if (isSvg) b.innerHTML = icon;
+  else b.textContent = icon;
   b.title = title;
+
+  const primary = Boolean(opts.primary);
+  const rest = primary ? "#fff" : "rgba(255,255,255,0.08)";
+  const hover = primary ? "#f2f2f2" : "rgba(255,255,255,0.2)";
   Object.assign(b.style, {
     width: `${size}px`,
     height: `${size}px`,
     borderRadius: "50%",
     border: "none",
-    background: "rgba(255,255,255,0.1)",
-    color: "#fff",
+    background: rest,
+    color: primary ? "#000" : "#fff",
     cursor: "pointer",
-    fontSize: `${Math.round(size * 0.4)}px`,
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
     padding: "0",
     lineHeight: "1",
+    flex: "0 0 auto",
+    transition: "background 0.12s ease, transform 0.12s ease",
+    ...(isSvg ? {} : { fontSize: `${Math.round(size * 0.4)}px` }),
+  });
+  b.addEventListener("mouseenter", () => {
+    b.style.background = hover;
+    b.style.transform = "scale(1.08)";
+  });
+  b.addEventListener("mouseleave", () => {
+    b.style.background = rest;
+    b.style.transform = "none";
   });
   return b;
 }
@@ -359,20 +391,27 @@ function buildDock(inline) {
   const row = document.createElement("div");
   Object.assign(row.style, { display: "flex", gap: "10px", alignItems: "center" });
 
+  // A soft dark shadow keeps text/art legible over any background image the user
+  // picks for the mini-player, without dimming their whole image.
+  const textShadow = "0 1px 3px rgba(0,0,0,0.9)";
+
   const art = document.createElement("img");
-  Object.assign(art.style, { width: `${artSize}px`, height: `${artSize}px`, borderRadius: "6px", flex: "0 0 auto" });
+  Object.assign(art.style, {
+    width: `${artSize}px`, height: `${artSize}px`, borderRadius: "6px", flex: "0 0 auto",
+    boxShadow: "0 2px 6px rgba(0,0,0,0.45)",
+  });
 
   const info = document.createElement("div");
   Object.assign(info.style, { minWidth: "0", flex: "1 1 auto" });
   const title = document.createElement("div");
   Object.assign(title.style, {
     fontWeight: "600", fontSize: inline ? "12px" : "13px", whiteSpace: "nowrap",
-    overflow: "hidden", textOverflow: "ellipsis",
+    overflow: "hidden", textOverflow: "ellipsis", textShadow,
   });
   const artist = document.createElement("div");
   Object.assign(artist.style, {
-    fontSize: inline ? "11px" : "12px", opacity: "0.7", whiteSpace: "nowrap",
-    overflow: "hidden", textOverflow: "ellipsis",
+    fontSize: inline ? "11px" : "12px", opacity: "0.75", whiteSpace: "nowrap",
+    overflow: "hidden", textOverflow: "ellipsis", textShadow,
   });
   info.append(title, artist);
   row.append(art, info);
@@ -399,7 +438,8 @@ function buildDock(inline) {
   const times = document.createElement("div");
   Object.assign(times.style, {
     display: "flex", justifyContent: "space-between",
-    fontSize: "11px", opacity: "0.6", marginTop: "3px",
+    fontSize: "11px", opacity: "0.75", marginTop: "3px",
+    textShadow: "0 1px 2px rgba(0,0,0,0.9)",
   });
   const elapsed = document.createElement("span");
   const duration = document.createElement("span");
@@ -445,14 +485,14 @@ function buildDock(inline) {
     display: "flex", gap: "8px", alignItems: "center",
     justifyContent: inline ? "flex-start" : "center", marginTop: inline ? "8px" : "10px",
   });
-  const prev = circleButton("⏮", "Previous", btnSize);
-  const play = circleButton("▶", "Play / Pause", btnSize);
-  const next = circleButton("⏭", "Next", btnSize);
+  const prev = circleButton(ICONS.prev, "Previous", btnSize);
+  const play = circleButton(ICONS.play, "Play / Pause", btnSize + 4, { primary: true });
+  const next = circleButton(ICONS.next, "Next", btnSize);
 
   // Mode button: docked → pop out into a floating card; floating → dock back.
   const modeBtn = inline
-    ? circleButton("⤢", "Pop out (drag anywhere)", btnSize)
-    : circleButton("⤓", "Dock to sidebar", btnSize);
+    ? circleButton(ICONS.popout, "Pop out (drag anywhere)", btnSize)
+    : circleButton(ICONS.dock, "Dock to sidebar", btnSize);
   modeBtn.style.marginLeft = "auto"; // push to the far end of the row
   modeBtn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -477,8 +517,10 @@ function buildDock(inline) {
 // Paint a mini-player from a nowPlaying() result; hide it when there's no track.
 function updateDock(dock, data) {
   const r = dock._refs;
+  const inline = dock.id === DOCK_INLINE_ID;
   if (!data || !data.connected || !data.track) {
     dock.style.display = "none";
+    if (inline) updateInlineReserve();
     return;
   }
   dock.style.display = "block";
@@ -500,7 +542,11 @@ function updateDock(dock, data) {
   }
   const playing = Boolean(data.playing);
   r.play.dataset.playing = playing ? "1" : "0";
-  r.play.textContent = playing ? "⏸" : "▶";
+  r.play.innerHTML = playing ? ICONS.pause : ICONS.play;
+
+  // Now that the card is populated (final height known), reserve its footprint
+  // so the sidebar's own content sits below it instead of behind it.
+  if (inline) updateInlineReserve();
 }
 
 // The single active mini-player element, whichever mode we're in.
@@ -525,6 +571,51 @@ function injectInlineDock() {
   document.documentElement.appendChild(buildDock(true));
 }
 
+// The left column that holds the search box + nav + DM/channel list. It's
+// `privateChannels_` in the Home/DMs view and `sidebar_` inside a server (never
+// the settings `sidebar__`). Padding the top of this pushes its own content down.
+const SIDEBAR_SELECTOR =
+  '[class*="privateChannels_"], [class*="sidebar_"]:not([class*="sidebar__"])';
+
+// Reserve vertical space at the top of the left sidebar column so the docked
+// player floats there WITHOUT covering the search box / nav — Discord's content
+// flows below it instead. The rule lives in its own <style> so Discord's frequent
+// re-renders don't wipe it (inline styles on Discord's own nodes get replaced).
+function setSidebarReserve(px) {
+  if (px === dockInlineReserve) return;
+  dockInlineReserve = px;
+  let el = document.getElementById(DOCK_RESERVE_ID);
+  if (!px) {
+    el?.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement("style");
+    el.id = DOCK_RESERVE_ID;
+    document.head.appendChild(el);
+  }
+  el.textContent =
+    `${SIDEBAR_SELECTOR} { padding-top: ${px}px !important; box-sizing: border-box !important; }`;
+}
+
+// Reserve exactly the gap between the docked player's bottom edge and the top of
+// the sidebar column, so the column's content begins just below the player. When
+// the player is hidden (no track) or not docked, clear the reservation.
+function updateInlineReserve() {
+  const dock = document.getElementById(DOCK_INLINE_ID);
+  const visible = dock && dock.style.display !== "none";
+  const col = document.querySelector(SIDEBAR_SELECTOR);
+  if (!visible || !col) {
+    setSidebarReserve(0);
+    return;
+  }
+  // Padding is inside the column, so its own top edge doesn't move — measuring it
+  // after a previous reserve stays stable (no feedback loop).
+  const colTop = col.getBoundingClientRect().top;
+  const dockBottom = dock.getBoundingClientRect().bottom;
+  setSidebarReserve(Math.max(0, Math.round(dockBottom + 8 - colTop)));
+}
+
 // Create/remove the mini-player (in whichever mode) and its polling timer to
 // match the settings. Called from applyStyles, so it re-syncs on any change.
 function syncDockedPlayer() {
@@ -533,6 +624,7 @@ function syncDockedPlayer() {
   if (!enabled) {
     document.getElementById(DOCK_ID)?.remove();
     document.getElementById(DOCK_INLINE_ID)?.remove();
+    setSidebarReserve(0);
     if (dockInterval) {
       clearInterval(dockInterval);
       dockInterval = null;
@@ -542,6 +634,7 @@ function syncDockedPlayer() {
 
   if ((val("dockMode") || "docked") === "floating") {
     document.getElementById(DOCK_INLINE_ID)?.remove();
+    setSidebarReserve(0); // floating card doesn't displace sidebar content
     if (!document.getElementById(DOCK_ID)) {
       (document.body || document.documentElement).appendChild(buildDock(false));
     }
