@@ -148,6 +148,19 @@ function backgroundResource(settings) {
   return resourceForFile(settings.backgroundFile);
 }
 
+// The preload is sandboxed (no fs), so it can't read our main-world patcher script
+// itself. We read it here and hand the source over synchronously at document-start,
+// where the preload injects it into Discord's page context. Read fresh each launch
+// so edits to webpack.js take effect on restart.
+ipcMain.on("dr:get-patcher-source", (event) => {
+  try {
+    event.returnValue = fs.readFileSync(path.join(__dirname, "webpack.js"), "utf8");
+  } catch (err) {
+    console.error("[DiscordRenewed] failed to read patcher source:", err.message);
+    event.returnValue = "";
+  }
+});
+
 // On startup the preload asks for the saved settings so it can re-apply them.
 // Returns every saved setting plus the background as a { type, url } resource.
 ipcMain.handle("dr:get-settings", () => {

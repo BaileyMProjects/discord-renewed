@@ -9,6 +9,57 @@
 
 const { ipcRenderer } = require("electron");
 
+// Inject our MAIN-WORLD patcher (webpack.js) into Discord's page context. Our
+// preload lives in an isolated world and can't see Discord's internal module
+// system, so the patcher has to run as a page <script>. We do this at the very top
+// of preload (document-start) so its webpack hook is in place before Discord's
+// bundle loads. Discord's CSP is stripped in main.js, so the inline script runs.
+// NOTE: this preload is sandboxed, so it can't require("fs") — the main process
+// reads the patcher source and hands it over synchronously via sendSync.
+(function injectMainWorldPatcher() {
+  let code;
+  try {
+    code = ipcRenderer.sendSync("dr:get-patcher-source");
+  } catch (e) {
+    return console.log("[DiscordRenewed] patcher source failed:", e && e.message);
+  }
+  if (!code) return console.log("[DiscordRenewed] patcher source empty");
+
+  const run = () => {
+    const root = document.documentElement || document.head || document.body;
+    if (!root) return false; // <html> not created yet — try again when it is
+    try {
+      const script = document.createElement("script");
+      script.textContent = code;
+      root.appendChild(script);
+      script.remove(); // its code has already executed; keep the DOM tidy
+    } catch (e) {
+      console.log("[DiscordRenewed] patcher inject error:", e && e.message);
+    }
+    return true;
+  };
+
+  // At document-start the <html> element may not exist yet; if so, watch the
+  // document and inject the moment it appears (still before Discord's bundle runs).
+  if (!run()) {
+    const obs = new MutationObserver(() => {
+      if (run()) obs.disconnect();
+    });
+    obs.observe(document, { childList: true, subtree: true });
+  }
+})();
+
+// Bridge for messages coming back from the main-world patcher (webpack.js).
+let webpackStatus = null; // last { ok, moduleCount, ... } reported by the patcher
+window.addEventListener("message", (e) => {
+  const d = e.data;
+  if (!d || d.source !== "dr-wp") return;
+  if (d.type === "status") {
+    webpackStatus = d.status;
+    console.log("[DiscordRenewed] webpack status:", JSON.stringify(d.status));
+  }
+});
+
 const STYLE_ID = "dr-styles";
 const SECTION_ID = "dr-settings-section";
 const PAGE_ID = "dr-settings-page";
