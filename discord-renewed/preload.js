@@ -47,8 +47,20 @@ const SCHEMA = [
 // section and shows only its listed sections' controls. To add a tab, add an
 // entry here; to move a section between tabs, edit its `sections` list.
 const TABS = [
-  { id: "customize", label: "Customize", sections: ["Background", "System"] },
-  { id: "spotify", label: "Spotify", sections: ["Spotify"] },
+  {
+    id: "customize",
+    label: "Customize",
+    sections: ["Background", "System"],
+    // "sliders" icon (Feather) — inherits the item's text colour via currentColor.
+    icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+  },
+  {
+    id: "spotify",
+    label: "Spotify",
+    sections: ["Spotify"],
+    // Spotify brand mark.
+    icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.586 14.424c-.18.295-.563.387-.857.207-2.35-1.435-5.305-1.76-8.786-.963-.335.077-.67-.133-.746-.469-.077-.336.132-.67.469-.746 3.809-.871 7.076-.496 9.713 1.115.294.18.386.563.207.856zm1.223-2.722c-.226.367-.706.482-1.073.257-2.687-1.652-6.785-2.13-9.965-1.166-.413.127-.85-.106-.977-.518-.126-.413.106-.849.519-.976 3.632-1.102 8.147-.568 11.234 1.328.366.226.482.707.256 1.073zm.105-2.835C14.692 8.95 9.375 8.775 6.297 9.71c-.493.15-1.016-.128-1.166-.62-.149-.493.129-1.016.622-1.166 3.532-1.073 9.404-.865 13.115 1.338.445.264.59.837.327 1.282-.264.444-.838.59-1.282.327z"/></svg>',
+  },
 ];
 
 function schemaFor(id) {
@@ -303,16 +315,23 @@ function buildDock(inline) {
   dock.id = inline ? DOCK_INLINE_ID : DOCK_ID;
 
   if (inline) {
+    // A fixed overlay pinned at the top-left (its previous spot), so it looks
+    // docked there WITHOUT taking layout space — Discord's server list and
+    // channels fill the whole height normally instead of leaving a blank row.
     Object.assign(dock.style, {
       boxSizing: "border-box",
-      flex: "0 0 auto", // don't let the sidebar's flex layout squash it
-      margin: "0 8px 8px",
+      position: "fixed",
+      left: "78px", // clear the guild rail
+      top: `${TITLEBAR_H + 4}px`, // just below our title bar
+      width: "296px",
+      zIndex: "1000",
       padding: "8px 10px",
       background: dockBgFor(true),
       border: "1px solid rgba(255,255,255,0.08)",
       borderRadius: "8px",
       color: "var(--text-normal, #dbdee1)",
       display: "none", // shown by updateDock when there's a track
+      boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
     });
   } else {
     Object.assign(dock.style, {
@@ -499,14 +518,11 @@ function pollDock() {
     .finally(() => (dockBusy = false));
 }
 
-// Insert the docked (inline) mini-player just above Discord's profile card. That
-// card lives at the bottom of the left sidebar; inserting before it makes the
-// channel list flex to leave room, so it reads as part of the app.
+// Add the docked (inline) mini-player. It's a FIXED overlay pinned above the
+// user panel, so it reads as docked there but never disturbs Discord's layout.
 function injectInlineDock() {
   if (document.getElementById(DOCK_INLINE_ID)) return;
-  const panels = document.querySelector('[class*="panels_"]');
-  if (!panels || !panels.parentElement) return; // sidebar not on screen yet
-  panels.parentElement.insertBefore(buildDock(true), panels);
+  document.documentElement.appendChild(buildDock(true));
 }
 
 // Create/remove the mini-player (in whichever mode) and its polling timer to
@@ -548,10 +564,140 @@ function ensureDockPresent() {
   if (document.getElementById(DOCK_INLINE_ID)) pollDock(); // refresh once after re-insert
 }
 
+// ---------------------------------------------------------------------------
+// Custom (frameless) title bar. The OS frame is off (main.js frame:false), so we
+// draw a thin Discord-style bar with minimize / maximize / close, draggable to
+// move the window. A CSS rule reserves the strip so Discord sits below it.
+// ---------------------------------------------------------------------------
+
+const TITLEBAR_ID = "dr-titlebar";
+const TITLEBAR_H = 30;
+
+const winCtl = (action) => ipcRenderer.send(`dr:win-${action}`);
+
+// A full-height title-bar button (window controls, and the inbox/help icons).
+function titlebarButton(svg, hoverBg, width = 46) {
+  const b = document.createElement("button");
+  b.innerHTML = svg;
+  Object.assign(b.style, {
+    width: `${width}px`, height: `${TITLEBAR_H}px`, border: "none", background: "transparent",
+    color: "#b5bac1", cursor: "pointer", display: "flex", alignItems: "center",
+    justifyContent: "center", padding: "0",
+  });
+  b.style.setProperty("-webkit-app-region", "no-drag"); // buttons click, don't drag
+  b.addEventListener("mouseenter", () => (b.style.background = hoverBg));
+  b.addEventListener("mouseleave", () => (b.style.background = "transparent"));
+  return b;
+}
+
+// A small rounded nav button (back / forward), like Discord's.
+function titlebarNavButton(svg) {
+  const b = document.createElement("button");
+  b.innerHTML = svg;
+  Object.assign(b.style, {
+    width: "28px", height: "22px", border: "none", background: "transparent",
+    color: "#b5bac1", cursor: "pointer", display: "flex", alignItems: "center",
+    justifyContent: "center", padding: "0", borderRadius: "4px",
+  });
+  b.style.setProperty("-webkit-app-region", "no-drag");
+  b.addEventListener("mouseenter", () => (b.style.background = "rgba(255,255,255,0.08)"));
+  b.addEventListener("mouseleave", () => (b.style.background = "transparent"));
+  return b;
+}
+
+function syncTitlebar() {
+  if (document.getElementById(TITLEBAR_ID)) return;
+
+  const bar = document.createElement("div");
+  bar.id = TITLEBAR_ID;
+  Object.assign(bar.style, {
+    position: "fixed", top: "0", left: "0", right: "0", height: `${TITLEBAR_H}px`,
+    zIndex: "100000", display: "flex", alignItems: "center",
+    background: "#121214", // matches the real Discord desktop title bar
+    // Use Discord's own font (loaded by the page) so the title text matches.
+    fontFamily: 'var(--font-primary, "gg sans", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif)',
+  });
+  bar.style.setProperty("-webkit-app-region", "drag"); // whole bar drags the window
+
+  // Left: back / forward (navigate Discord's history), like the real client.
+  const navWrap = document.createElement("div");
+  Object.assign(navWrap.style, { display: "flex", alignItems: "center", gap: "2px", paddingLeft: "8px" });
+  const back = titlebarNavButton('<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>');
+  const fwd = titlebarNavButton('<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>');
+  back.addEventListener("click", () => winCtl("back"));
+  fwd.addEventListener("click", () => winCtl("forward"));
+  navWrap.append(back, fwd);
+
+  // Center: the current Discord context (uses the page title, which Discord keeps
+  // updated to the active channel/server) so the bar feels native.
+  const title = document.createElement("div");
+  Object.assign(title.style, {
+    position: "absolute", left: "50%", top: "0", height: `${TITLEBAR_H}px`,
+    transform: "translateX(-50%)", display: "flex", alignItems: "center",
+    fontSize: "14px", fontWeight: "600", color: "#dbdee1", pointerEvents: "none",
+    maxWidth: "50%", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis",
+  });
+  const setTitle = () => {
+    let t = (document.title || "").replace(/^\(\d+\)\s*/, "").trim(); // drop "(3)" unread badge
+    if (!t || t.toLowerCase() === "discord") t = "Discord Renewed";
+    title.textContent = t;
+  };
+  setTitle();
+  const titleEl = document.querySelector("title");
+  if (titleEl) new MutationObserver(setTitle).observe(titleEl, { childList: true, characterData: true, subtree: true });
+
+  // Right: Discord's inbox + help icons, a divider, then the window controls —
+  // matching the real client's title-bar layout.
+  const controls = document.createElement("div");
+  Object.assign(controls.style, { marginLeft: "auto", display: "flex", alignItems: "center" });
+
+  const inbox = titlebarButton(
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 12h-4c0 1.66-1.34 3-3 3s-3-1.34-3-3H5V5h14v10z"/></svg>',
+    "rgba(255,255,255,0.08)", 34
+  );
+  inbox.title = "Inbox";
+  // Best-effort: open Discord's own inbox popout if its button is present.
+  inbox.addEventListener("click", () => {
+    document.querySelector('[aria-label="Inbox"]')?.click();
+  });
+
+  const help = titlebarButton(
+    '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M11 18h2v-2h-2v2zm1-16C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm0-14c-2.21 0-4 1.79-4 4h2c0-1.1.9-2 2-2s2 .9 2 2c0 2-3 1.75-3 5h2c0-2.25 3-2.5 3-5 0-2.21-1.79-4-4-4z"/></svg>',
+    "rgba(255,255,255,0.08)", 34
+  );
+  help.title = "Help";
+  help.addEventListener("click", () => ipcRenderer.send("dr:open-external", "https://support.discord.com"));
+
+  const divider = document.createElement("div");
+  Object.assign(divider.style, { width: "1px", height: "16px", background: "rgba(255,255,255,0.12)", margin: "0 6px" });
+
+  const min = titlebarButton('<svg width="12" height="12" viewBox="0 0 12 12"><rect x="2" y="5.5" width="8" height="1" fill="currentColor"/></svg>', "rgba(255,255,255,0.1)");
+  const max = titlebarButton('<svg width="12" height="12" viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/></svg>', "rgba(255,255,255,0.1)");
+  const close = titlebarButton('<svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 2 L10 10 M10 2 L2 10" stroke="currentColor" stroke-width="1.2"/></svg>', "#e81123");
+  close.addEventListener("mouseenter", () => (close.style.color = "#fff"));
+  close.addEventListener("mouseleave", () => (close.style.color = "#b5bac1"));
+  min.addEventListener("click", () => winCtl("minimize"));
+  max.addEventListener("click", () => winCtl("maximize"));
+  close.addEventListener("click", () => winCtl("close"));
+  controls.append(inbox, help, divider, min, max, close);
+
+  bar.append(navWrap, title, controls);
+  document.documentElement.appendChild(bar);
+}
+
+// Reserve the title-bar strip so Discord's root sits below it, and hide Discord's
+// own (web) title bar — it has no window controls and would duplicate ours.
+function titlebarCss() {
+  return `
+    #app-mount { position: absolute !important; inset: ${TITLEBAR_H}px 0 0 0 !important; }
+    [class*="bar_"]:has(> [class*="title_"]) { display: none !important; }
+  `;
+}
+
 // Combine every section's CSS. Future sections (theme, fonts, custom CSS) get
 // appended here.
 function buildCss() {
-  return backgroundCss();
+  return backgroundCss() + titlebarCss();
 }
 
 function applyStyles() {
@@ -561,6 +707,7 @@ function applyStyles() {
   syncVideoElement();
   syncDockedPlayer();
   applyDockAppearance();
+  syncTitlebar();
 
   let style = document.getElementById(STYLE_ID);
   const css = buildCss();
@@ -1126,6 +1273,16 @@ function injectSettings() {
     });
     relabelItem(li, tab.label);
 
+    // Prepend a small icon before the label so our items match Discord's native ones.
+    const content = li.querySelector('[class*="itemContent_"]');
+    if (content && tab.icon) {
+      Object.assign(content.style, { display: "flex", alignItems: "center", gap: "8px" });
+      const icon = document.createElement("span");
+      icon.innerHTML = tab.icon;
+      Object.assign(icon.style, { display: "inline-flex", flex: "0 0 auto", width: "18px", height: "18px", opacity: "0.9" });
+      content.insertBefore(icon, content.firstChild);
+    }
+
     const clickable = li.querySelector('[class*="itemContent_"]')?.parentElement || li;
     clickable.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -1150,6 +1307,7 @@ function injectSettings() {
 const observer = new MutationObserver(() => {
   injectSettings();
   ensureDockPresent();
+  syncTitlebar();
 });
 window.addEventListener("DOMContentLoaded", () => {
   observer.observe(document.documentElement, { childList: true, subtree: true });

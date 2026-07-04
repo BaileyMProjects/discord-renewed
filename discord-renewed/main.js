@@ -3,7 +3,7 @@
 // application window and load Discord into it. Later we'll use this same
 // process to wire up our custom settings.
 
-const { app, BrowserWindow, ipcMain, dialog, session, protocol, net } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, session, protocol, net, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
@@ -35,7 +35,11 @@ function createWindow() {
     width: 1280,
     height: 800,
     title: "Discord Renewed",
-    autoHideMenuBar: true, // hide the default File/Edit/View menu bar
+    // Frameless: drop the OS title bar + window buttons. We draw our own
+    // Discord-style title bar in the page (see syncTitlebar in preload.js) so the
+    // window doesn't look like a browser tab. Still resizable from the edges.
+    frame: false,
+    backgroundColor: "#1e1f22", // avoid a white flash before Discord paints
     webPreferences: {
       // Security defaults — we keep Node out of the Discord page itself.
       // Our customization runs in the preload script below, NOT in Discord's
@@ -322,6 +326,27 @@ ipcMain.handle("dr:spotify-now-playing", () => spotify.nowPlaying());
 ipcMain.handle("dr:spotify-control", (_event, action) => spotify.control(action));
 
 ipcMain.handle("dr:spotify-seek", (_event, positionMs) => spotify.seek(positionMs));
+
+// Window controls for our custom (frameless) title bar.
+ipcMain.on("dr:win-minimize", (e) => BrowserWindow.fromWebContents(e.sender)?.minimize());
+ipcMain.on("dr:win-maximize", (e) => {
+  const w = BrowserWindow.fromWebContents(e.sender);
+  if (!w) return;
+  if (w.isMaximized()) w.unmaximize();
+  else w.maximize();
+});
+ipcMain.on("dr:win-close", (e) => BrowserWindow.fromWebContents(e.sender)?.close());
+ipcMain.on("dr:win-back", (e) => {
+  const wc = BrowserWindow.fromWebContents(e.sender)?.webContents;
+  if (wc?.navigationHistory?.canGoBack()) wc.navigationHistory.goBack();
+});
+ipcMain.on("dr:win-forward", (e) => {
+  const wc = BrowserWindow.fromWebContents(e.sender)?.webContents;
+  if (wc?.navigationHistory?.canGoForward()) wc.navigationHistory.goForward();
+});
+ipcMain.on("dr:open-external", (_e, url) => {
+  if (typeof url === "string" && url.startsWith("https://")) shell.openExternal(url);
+});
 
 // Discord sends a strict Content-Security-Policy that would block the styles
 // and images we inject. Because we own this desktop shell, we strip that
