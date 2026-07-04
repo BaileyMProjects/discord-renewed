@@ -37,6 +37,8 @@ const SCHEMA = [
   { section: "System", id: "perfMode", type: "select", label: "Performance mode (applies after restart). Measured RAM vs Discord's ~590 MB — Smooth: full GPU, ~490 MB (~17% lighter), buttery. Optimised: GPU off, ~380 MB (~36% lighter) but video/screen-share/animation get clunkier.", choices: ["Smooth", "Optimised"], def: "Smooth" },
   { section: "Spotify", id: "spotify", type: "spotify", label: "Spotify" },
   { section: "Spotify", id: "dockedPlayer", type: "toggle", label: "Show a Spotify mini-player docked above your profile (pop it out with ⤢ to drag it anywhere)", def: false },
+  { section: "Spotify", id: "tabColor", type: "color", label: "Mini-player background colour", def: "", defColor: "#1e1f22" },
+  { section: "Spotify", id: "tabLineColor", type: "color", label: "Progress bar colour", def: "", defColor: "#1DB954" },
 ];
 
 function schemaFor(id) {
@@ -213,6 +215,30 @@ function circleButton(glyph, title, size = 36) {
 const spotifyControl = (action) => ipcRenderer.invoke("dr:spotify-control", action);
 const spotifySeek = (ms) => ipcRenderer.invoke("dr:spotify-seek", ms);
 
+// The mini-player's background: the user's chosen colour if set, else the
+// built-in look (a subtle fill inline, a solid frosted card when floating).
+function dockBgFor(inline) {
+  const color = val("tabColor");
+  if (color) return color;
+  return inline ? "rgba(0,0,0,0.22)" : "rgba(24,25,28,0.92)";
+}
+
+// The progress-bar fill colour: the user's choice if set, else Spotify green.
+function dockLineColor() {
+  return val("tabLineColor") || "#1DB954";
+}
+
+// Re-apply the chosen background + line colour to whichever mini-player is on
+// screen, so colour changes preview live without rebuilding the element.
+function applyDockAppearance() {
+  const line = dockLineColor();
+  [document.getElementById(DOCK_ID), document.getElementById(DOCK_INLINE_ID)].forEach((el) => {
+    if (!el) return;
+    el.style.background = dockBgFor(el.id === DOCK_INLINE_ID);
+    if (el._refs && el._refs.barFill) el._refs.barFill.style.background = line;
+  });
+}
+
 // Let the dock be dragged around by its body (but not when a button is clicked),
 // clamped to the window, saving its final position so it stays put next launch.
 function makeDockDraggable(dock) {
@@ -264,7 +290,7 @@ function buildDock(inline) {
       flex: "0 0 auto", // don't let the sidebar's flex layout squash it
       margin: "0 8px 8px",
       padding: "8px 10px",
-      background: "rgba(0,0,0,0.22)",
+      background: dockBgFor(true),
       border: "1px solid rgba(255,255,255,0.08)",
       borderRadius: "8px",
       color: "var(--text-normal, #dbdee1)",
@@ -277,7 +303,7 @@ function buildDock(inline) {
       top: `${settings.dockTop ?? Math.max(16, window.innerHeight - 170)}px`,
       width: "300px",
       zIndex: "9999",
-      background: "rgba(24,25,28,0.92)",
+      background: dockBgFor(false),
       border: "1px solid rgba(255,255,255,0.1)",
       borderRadius: "10px",
       padding: "12px",
@@ -323,7 +349,7 @@ function buildDock(inline) {
     background: "rgba(255,255,255,0.15)", overflow: "hidden",
   });
   const barFill = document.createElement("div");
-  Object.assign(barFill.style, { height: "100%", width: "0%", background: "#1DB954" });
+  Object.assign(barFill.style, { height: "100%", width: "0%", background: dockLineColor() });
   barTrack.appendChild(barFill);
 
   const seekArea = document.createElement("div");
@@ -516,6 +542,7 @@ function applyStyles() {
   // video element and dimming overlay update alongside the styles.
   syncVideoElement();
   syncDockedPlayer();
+  applyDockAppearance();
 
   let style = document.getElementById(STYLE_ID);
   const css = buildCss();
@@ -798,6 +825,49 @@ function renderControl(ctrl) {
     const b = makeButton(ctrl.label, ctrl.bg || "#4e5058");
     b.addEventListener("click", () => runButtonAction(ctrl.action, b));
     wrap.appendChild(b);
+    return wrap;
+  }
+
+  if (ctrl.type === "color") {
+    wrap.appendChild(controlLabel(ctrl.label));
+    const rowc = document.createElement("div");
+    Object.assign(rowc.style, { display: "flex", gap: "10px", alignItems: "center" });
+
+    const swatchDefault = ctrl.defColor || "#1e1f22";
+
+    // The native <input type=color> always paints a white swatch we can't restyle,
+    // so we hide it and show our own dark-framed swatch that reflects the colour.
+    const swatch = document.createElement("div");
+    Object.assign(swatch.style, {
+      position: "relative", width: "48px", height: "34px", borderRadius: "6px",
+      border: "1px solid rgba(255,255,255,0.15)", background: val(ctrl.id) || swatchDefault,
+      cursor: "pointer", overflow: "hidden",
+    });
+
+    const input = document.createElement("input");
+    input.type = "color";
+    input.value = val(ctrl.id) || swatchDefault;
+    Object.assign(input.style, {
+      position: "absolute", inset: "0", width: "100%", height: "100%",
+      opacity: "0", border: "none", padding: "0", cursor: "pointer",
+    });
+    input.addEventListener("input", () => {
+      swatch.style.background = input.value;
+      settings[ctrl.id] = input.value;
+      applyStyles(); // live preview
+    });
+    input.addEventListener("change", () => setSetting(ctrl.id, input.value));
+    swatch.appendChild(input);
+
+    const reset = makeButton("Default", "#4e5058");
+    reset.addEventListener("click", () => {
+      input.value = swatchDefault;
+      swatch.style.background = swatchDefault;
+      setSetting(ctrl.id, ""); // empty → fall back to the built-in look
+    });
+
+    rowc.append(swatch, reset);
+    wrap.appendChild(rowc);
     return wrap;
   }
 
