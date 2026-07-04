@@ -11,7 +11,6 @@ const { ipcRenderer } = require("electron");
 
 const STYLE_ID = "dr-styles";
 const SECTION_ID = "dr-settings-section";
-const ITEM_ID = "dr-settings-item";
 const PAGE_ID = "dr-settings-page";
 const VIDEO_ID = "dr-video-bg";
 
@@ -42,6 +41,14 @@ const SCHEMA = [
   { section: "Spotify", id: "tabLineColor", type: "color", label: "Progress bar colour", def: "", defColor: "#1DB954" },
   { section: "Spotify", id: "tabImage", type: "tabImage", label: "Mini-player background image" },
   { section: "Spotify", id: "tabDim", type: "slider", label: "Mini-player image dimming", min: 0, max: 100, step: 1, def: 0, suffix: "%" },
+];
+
+// Sidebar tabs: each becomes its own item under our "Discord Renewed" settings
+// section and shows only its listed sections' controls. To add a tab, add an
+// entry here; to move a section between tabs, edit its `sections` list.
+const TABS = [
+  { id: "customize", label: "Customize", sections: ["Background", "System"] },
+  { id: "spotify", label: "Spotify", sections: ["Spotify"] },
 ];
 
 function schemaFor(id) {
@@ -940,12 +947,12 @@ function renderControl(ctrl) {
   return wrap;
 }
 
-function buildPageContent() {
+function buildPageContent(tab) {
   const inner = document.createElement("div");
   Object.assign(inner.style, { maxWidth: "740px", padding: "60px 40px 80px", boxSizing: "border-box" });
 
   const title = document.createElement("h2");
-  title.textContent = "Discord Renewed";
+  title.textContent = tab ? tab.label : "Discord Renewed";
   Object.assign(title.style, {
     margin: "0 0 24px",
     fontSize: "20px",
@@ -954,9 +961,11 @@ function buildPageContent() {
   });
   inner.appendChild(title);
 
-  // Group controls by section, in first-seen order.
+  // Group this tab's controls by section, in first-seen order.
+  const wanted = tab ? tab.sections : null;
   const sections = [];
   for (const ctrl of SCHEMA) {
+    if (wanted && !wanted.includes(ctrl.section)) continue;
     let group = sections.find((g) => g.name === ctrl.section);
     if (!group) {
       group = { name: ctrl.section, controls: [] };
@@ -966,17 +975,20 @@ function buildPageContent() {
   }
 
   for (const group of sections) {
-    const heading = document.createElement("h3");
-    heading.textContent = group.name;
-    Object.assign(heading.style, {
-      margin: "8px 0 16px",
-      fontSize: "16px",
-      fontWeight: "600",
-      color: "var(--header-primary, #f2f3f5)",
-      borderBottom: "1px solid rgba(255,255,255,0.08)",
-      paddingBottom: "8px",
-    });
-    inner.appendChild(heading);
+    // With a single section the tab title already names it, so skip the heading.
+    if (sections.length > 1) {
+      const heading = document.createElement("h3");
+      heading.textContent = group.name;
+      Object.assign(heading.style, {
+        margin: "8px 0 16px",
+        fontSize: "16px",
+        fontWeight: "600",
+        color: "var(--header-primary, #f2f3f5)",
+        borderBottom: "1px solid rgba(255,255,255,0.08)",
+        paddingBottom: "8px",
+      });
+      inner.appendChild(heading);
+    }
     group.controls.forEach((ctrl) => inner.appendChild(renderControl(ctrl)));
   }
 
@@ -1009,7 +1021,7 @@ function relabelItem(root, newText) {
 // ---------------------------------------------------------------------------
 
 function findContentPane() {
-  const ours = document.getElementById(ITEM_ID) || document.getElementById(SECTION_ID);
+  const ours = document.getElementById(SECTION_ID);
   const aside = ours
     ? ours.closest('[class*="sidebar__"]')
     : document.querySelector('[class*="sidebar__"]');
@@ -1017,13 +1029,16 @@ function findContentPane() {
   return aside.parentElement.querySelector(':scope > [class*="content_"]');
 }
 
-function setItemActive(active) {
-  const li = document.getElementById(ITEM_ID);
-  if (!li) return;
-  const clickable = li.querySelector('[class*="itemContent_"]')?.parentElement || li;
-  clickable.style.backgroundColor = active
-    ? "var(--background-modifier-selected, rgba(255,255,255,0.08))"
-    : "";
+// Highlight the given tab's sidebar item (by dr-item-<id>), clearing the others.
+// Pass null to clear all.
+function setActiveItem(activeId) {
+  for (const tab of TABS) {
+    const li = document.getElementById(`dr-item-${tab.id}`);
+    if (!li) continue;
+    const clickable = li.querySelector('[class*="itemContent_"]')?.parentElement || li;
+    clickable.style.backgroundColor =
+      `dr-item-${tab.id}` === activeId ? "var(--background-modifier-selected, rgba(255,255,255,0.08))" : "";
+  }
 }
 
 let hiddenContent = [];
@@ -1037,10 +1052,10 @@ function hidePage() {
   hiddenContent = [];
   pageIntervals.forEach(clearInterval);
   pageIntervals = [];
-  setItemActive(false);
+  setActiveItem(null);
 }
 
-function showPage() {
+function showPage(tab) {
   hidePage();
   const pane = findContentPane();
   if (!pane) return;
@@ -1051,9 +1066,9 @@ function showPage() {
 
   const overlay = document.createElement("div");
   overlay.id = PAGE_ID;
-  overlay.appendChild(buildPageContent());
+  overlay.appendChild(buildPageContent(tab));
   pane.appendChild(overlay);
-  setItemActive(true);
+  setActiveItem(`dr-item-${tab.id}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,8 +1082,8 @@ function watchNav() {
   nav.addEventListener(
     "click",
     (e) => {
-      const ours = document.getElementById(ITEM_ID);
-      if (ours && ours.contains(e.target)) return; // our item shows our page
+      const section = document.getElementById(SECTION_ID);
+      if (section && section.contains(e.target)) return; // our items manage their own pages
       hidePage();
     },
     true
@@ -1094,25 +1109,30 @@ function injectSettings() {
   if (label) label.textContent = "Discord Renewed";
 
   const itemsUL = section.querySelector('[class*="sectionList__"]');
-  while (itemsUL.children.length > 1) itemsUL.removeChild(itemsUL.lastElementChild);
+  const template = itemsUL.firstElementChild; // reuse a real settings item as our template
+  itemsUL.innerHTML = "";
 
-  const ourLI = itemsUL.firstElementChild;
-  ourLI.id = ITEM_ID;
-  ourLI.querySelectorAll('[class*="subnavContainer"]').forEach((el) => el.remove());
-  ourLI.querySelectorAll("svg, img").forEach((el) => el.remove());
-  ourLI.querySelectorAll("[aria-selected]").forEach((el) => el.removeAttribute("aria-selected"));
-  ourLI.querySelectorAll("*").forEach((el) => {
-    Array.from(el.classList || []).forEach((c) => {
-      if (/selected|active/i.test(c)) el.classList.remove(c);
+  // One sidebar item per tab, each opening its own filtered page.
+  for (const tab of TABS) {
+    const li = template.cloneNode(true);
+    li.id = `dr-item-${tab.id}`;
+    li.querySelectorAll('[class*="subnavContainer"]').forEach((el) => el.remove());
+    li.querySelectorAll("svg, img").forEach((el) => el.remove());
+    li.querySelectorAll("[aria-selected]").forEach((el) => el.removeAttribute("aria-selected"));
+    li.querySelectorAll("*").forEach((el) => {
+      Array.from(el.classList || []).forEach((c) => {
+        if (/selected|active/i.test(c)) el.classList.remove(c);
+      });
     });
-  });
-  relabelItem(ourLI, "Customize");
+    relabelItem(li, tab.label);
 
-  const clickable = ourLI.querySelector('[class*="itemContent_"]')?.parentElement || ourLI;
-  clickable.addEventListener("click", (e) => {
-    e.stopPropagation();
-    showPage();
-  });
+    const clickable = li.querySelector('[class*="itemContent_"]')?.parentElement || li;
+    clickable.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showPage(tab);
+    });
+    itemsUL.appendChild(li);
+  }
 
   const logoutLeaf = findLeavesByText("Log Out")[0];
   const beforeNode = logoutLeaf
