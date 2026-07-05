@@ -3,7 +3,7 @@
 // application window and load Discord into it. Later we'll use this same
 // process to wire up our custom settings.
 
-const { app, BrowserWindow, ipcMain, dialog, session, protocol, net, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, session, protocol, net, shell, screen, desktopCapturer } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
@@ -361,6 +361,21 @@ ipcMain.on("dr:open-external", (_e, url) => {
   if (typeof url === "string" && url.startsWith("https://")) shell.openExternal(url);
 });
 
+ipcMain.on("dr:capture-source-chosen", handleCaptureChoice);
+
+// Reload Discord's page. Used by the Streaming tab's "Reload" button: the
+// stream-quality patch only affects Go Live/quality calls made AFTER it's
+// applied, so an already-open connection won't pick up a change mid-session —
+// reloading (or restarting the stream) guarantees the new setting takes effect.
+ipcMain.on("dr:reload", (e) => BrowserWindow.fromWebContents(e.sender)?.webContents.reload());
+
+// The primary display's resolution, used to resolve the Streaming tab's
+// "Auto (match my display)" option to an actual target height.
+ipcMain.handle("dr:get-display-size", () => {
+  const { width, height } = screen.getPrimaryDisplay().size;
+  return { width, height };
+});
+
 // Discord sends a strict Content-Security-Policy that would block the styles
 // and images we inject. Because we own this desktop shell, we strip that
 // header from Discord's responses. Trade-off: this lowers the page's built-in
@@ -376,6 +391,64 @@ function stripContentSecurityPolicy() {
     }
     callback({ responseHeaders: headers });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Screen/window share. We load Discord's real WEB app, which calls the
+// standard navigator.mediaDevices.getDisplayMedia() for Go Live/screenshare —
+// that works in a real browser tab because Chrome supplies its own OS picker,
+// but Electron does NOT do that for an arbitrary loaded page. Without wiring
+// this up, getDisplayMedia() has no source to resolve to and screenshare
+// silently does nothing. setDisplayMediaRequestHandler is the documented fix:
+// we fetch the available screens/windows via desktopCapturer, hand them to
+// preload to show a picker, and resolve Discord's request with whatever the
+// user picks (or {} to signal "cancelled" if they back out).
+// ---------------------------------------------------------------------------
+
+let pendingCaptureCallback = null;
+let pendingCaptureSources = [];
+
+function setupScreenShareHandler() {
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    if (pendingCaptureCallback) {
+      pendingCaptureCallback({}); // a stale request was still open — cancel it
+      pendingCaptureCallback = null;
+    }
+    const win = BrowserWindow.getAllWindows()[0];
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ["screen", "window"],
+        thumbnailSize: { width: 300, height: 170 },
+      });
+      pendingCaptureSources = sources;
+      pendingCaptureCallback = callback;
+      win?.webContents.send(
+        "dr:show-source-picker",
+        sources.map((s) => ({ id: s.id, name: s.name, isScreen: s.id.startsWith("screen:"), thumbnail: s.thumbnail.toDataURL() }))
+      );
+    } catch (err) {
+      console.error("[DiscordRenewed] desktopCapturer.getSources failed:", err.message);
+      callback({});
+    }
+  });
+}
+
+// The renderer's answer to the picker: { id, withAudio } for a choice, or
+// { id: null } to cancel. "loopback" system-audio capture is confirmed stable
+// on Windows (the Electron bug where it silently returns silence is macOS-only
+// — issue #49607) so it's only offered for full-screen sources, matching
+// Discord's own official picker (per-window audio loopback isn't reliable).
+function handleCaptureChoice(_event, choice) {
+  const cb = pendingCaptureCallback;
+  pendingCaptureCallback = null;
+  if (!cb) return;
+  const source = choice && choice.id ? pendingCaptureSources.find((s) => s.id === choice.id) : null;
+  pendingCaptureSources = [];
+  if (!source) {
+    cb({}); // cancelled, or the chosen id vanished (window closed mid-pick)
+    return;
+  }
+  cb({ video: source, audio: choice.withAudio ? "loopback" : undefined });
 }
 
 // If the user turned on "Low memory mode", apply memory-saving Chromium
@@ -446,6 +519,7 @@ if (!gotLock) {
     });
 
     stripContentSecurityPolicy();
+    setupScreenShareHandler();
     createWindow();
 
     // On macOS, apps usually stay open with no windows; re-create one when the

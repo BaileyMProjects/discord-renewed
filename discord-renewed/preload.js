@@ -51,14 +51,63 @@ const { ipcRenderer } = require("electron");
 
 // Bridge for messages coming back from the main-world patcher (webpack.js).
 let webpackStatus = null; // last { ok, moduleCount, ... } reported by the patcher
+let latestStreamStatus = null; // last { active, reason? } reported for the stream-quality unlock
+let streamStatusListeners = []; // settings-page callbacks to repaint on a new status
 window.addEventListener("message", (e) => {
   const d = e.data;
   if (!d || d.source !== "dr-wp") return;
   if (d.type === "status") {
     webpackStatus = d.status;
     console.log("[DiscordRenewed] webpack status:", JSON.stringify(d.status));
+    // Discord's modules may not have been searchable yet when we first sent the
+    // stream config (right after load); once webpack reports ready, resend it so
+    // an already-enabled unlock actually gets applied.
+    if (d.status && d.status.ok) sendStreamConfig();
+  } else if (d.type === "stream-status") {
+    latestStreamStatus = d.status;
+    streamStatusListeners.forEach((fn) => {
+      try {
+        fn(d.status);
+      } catch {}
+    });
   }
 });
+
+// The persisted stream-unlock settings, resolved into the config the patcher
+// understands. "auto" resolution resolves to the primary display's height
+// (fetched once at startup) so the unlock targets your actual monitor.
+let displaySize = null;
+ipcRenderer.invoke("dr:get-display-size").then((d) => {
+  displaySize = d;
+});
+
+function currentStreamConfig() {
+  const resSetting = val("streamRes");
+  const resolution =
+    resSetting === "auto" || !resSetting ? (displaySize && displaySize.height) || 2160 : Number(resSetting) || 2160;
+  return {
+    enabled: Boolean(val("streamUnlock")),
+    resolution,
+    fps: Number(val("streamFps")) || 60,
+    bitrateKbps: Number(val("streamBitrate")) || 8000,
+  };
+}
+
+function sendStreamConfig() {
+  window.postMessage({ source: "dr-wp-cmd", type: "config", config: currentStreamConfig() }, "*");
+}
+
+// Human-readable status line for the Streaming tab's readout.
+function streamStatusText(status) {
+  if (!val("streamUnlock")) return "Off.";
+  if (!status) return "Waiting for Discord to finish loading…";
+  if (status.active) return "Active — resolution / framerate / bitrate ceiling raised for new streams.";
+  if (status.reason === "modules not found") {
+    return "Inactive — Discord's client changed and the patch points weren't found. Nothing was modified.";
+  }
+  if (status.reason === "webpack not ready") return "Waiting for Discord to finish loading…";
+  return "Off.";
+}
 
 const STYLE_ID = "dr-styles";
 const SECTION_ID = "dr-settings-section";
@@ -92,6 +141,47 @@ const SCHEMA = [
   { section: "Spotify", id: "tabLineColor", type: "color", label: "Progress bar colour", def: "", defColor: "#1DB954" },
   { section: "Spotify", id: "tabImage", type: "tabImage", label: "Mini-player background image" },
   { section: "Spotify", id: "tabDim", type: "slider", label: "Mini-player image dimming", min: 0, max: 100, step: 1, def: 0, suffix: "%" },
+  {
+    section: "Streaming",
+    id: "streamUnlock",
+    type: "toggle",
+    label:
+      "⚠ Unlock source-quality screen share — raises Discord's built-in resolution/framerate/bitrate ceiling by " +
+      "modifying its client. This is against Discord's Terms of Service and could get your account actioned. " +
+      "Off by default; enable at your own risk.",
+    def: false,
+  },
+  {
+    section: "Streaming",
+    id: "streamRes",
+    type: "select",
+    label: "Resolution",
+    choices: ["auto", "720", "1080", "1440", "2160"],
+    labels: { auto: "Auto (match my display)", "720": "720p", "1080": "1080p", "1440": "1440p", "2160": "2160p (4K)" },
+    def: "auto",
+  },
+  {
+    section: "Streaming",
+    id: "streamFps",
+    type: "select",
+    label: "Frame rate",
+    choices: ["30", "60"],
+    labels: { "30": "30 fps", "60": "60 fps" },
+    def: "60",
+  },
+  {
+    section: "Streaming",
+    id: "streamBitrate",
+    type: "slider",
+    label: "Bitrate ceiling",
+    min: 2000,
+    max: 10000,
+    step: 500,
+    def: 8000,
+    suffix: " kbps",
+  },
+  { section: "Streaming", id: "streamStatus", type: "streamStatus", label: "Patch status" },
+  { section: "Streaming", id: "streamReload", type: "button", label: "Reload Discord (apply / fully remove changes)", action: "reload" },
 ];
 
 // Sidebar tabs: each becomes its own item under our "Discord Renewed" settings
@@ -112,6 +202,13 @@ const TABS = [
     // Spotify brand mark.
     icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.586 14.424c-.18.295-.563.387-.857.207-2.35-1.435-5.305-1.76-8.786-.963-.335.077-.67-.133-.746-.469-.077-.336.132-.67.469-.746 3.809-.871 7.076-.496 9.713 1.115.294.18.386.563.207.856zm1.223-2.722c-.226.367-.706.482-1.073.257-2.687-1.652-6.785-2.13-9.965-1.166-.413.127-.85-.106-.977-.518-.126-.413.106-.849.519-.976 3.632-1.102 8.147-.568 11.234 1.328.366.226.482.707.256 1.073zm.105-2.835C14.692 8.95 9.375 8.775 6.297 9.71c-.493.15-1.016-.128-1.166-.62-.149-.493.129-1.016.622-1.166 3.532-1.073 9.404-.865 13.115 1.338.445.264.59.837.327 1.282-.264.444-.838.59-1.282.327z"/></svg>',
   },
+  {
+    id: "streaming",
+    label: "Streaming",
+    sections: ["Streaming"],
+    // "video" icon (Feather).
+    icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>',
+  },
 ];
 
 function schemaFor(id) {
@@ -130,6 +227,7 @@ function setSetting(id, value) {
   settings[id] = value;
   ipcRenderer.invoke("dr:set-setting", id, value);
   applyStyles();
+  sendStreamConfig(); // cheap no-op unless a "stream*" setting changed
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +937,164 @@ function titlebarCss() {
   `;
 }
 
+// ---------------------------------------------------------------------------
+// Screen/window share picker. Electron doesn't supply an OS-level picker for a
+// loaded page's getDisplayMedia() calls (only real browsers do that), so
+// main.js's setDisplayMediaRequestHandler asks us to show one: it sends the
+// available sources here, we render a thumbnail grid, and send back which one
+// (if any) the user picked.
+// ---------------------------------------------------------------------------
+
+const PICKER_ID = "dr-source-picker";
+
+function closeSourcePicker(choice) {
+  document.getElementById(PICKER_ID)?.remove();
+  ipcRenderer.send("dr:capture-source-chosen", choice || { id: null });
+}
+
+function showSourcePicker(sources) {
+  document.getElementById(PICKER_ID)?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.id = PICKER_ID;
+  Object.assign(overlay.style, {
+    position: "fixed",
+    inset: "0",
+    zIndex: "200000",
+    background: "rgba(0,0,0,0.6)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  });
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeSourcePicker(null); // click outside = cancel
+  });
+
+  const card = document.createElement("div");
+  Object.assign(card.style, {
+    width: "min(680px, 90vw)",
+    maxHeight: "80vh",
+    display: "flex",
+    flexDirection: "column",
+    background: "#2b2d31",
+    border: "1px solid rgba(255,255,255,0.08)",
+    borderRadius: "12px",
+    boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
+    color: "var(--text-normal, #dbdee1)",
+    overflow: "hidden",
+  });
+
+  const header = document.createElement("div");
+  Object.assign(header.style, { padding: "20px 24px 4px", fontSize: "18px", fontWeight: "700" });
+  header.textContent = "What do you want to share?";
+  card.appendChild(header);
+
+  const grid = document.createElement("div");
+  Object.assign(grid.style, {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+    gap: "12px",
+    padding: "16px 24px",
+    overflowY: "auto",
+  });
+
+  let selectedId = null;
+  const tiles = [];
+
+  // Screens first (they can carry "Share audio"), then windows.
+  const ordered = [...sources].sort((a, b) => (a.isScreen === b.isScreen ? 0 : a.isScreen ? -1 : 1));
+
+  for (const src of ordered) {
+    const tile = document.createElement("button");
+    tile.dataset.id = src.id;
+    Object.assign(tile.style, {
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "stretch",
+      gap: "6px",
+      padding: "8px",
+      background: "rgba(0,0,0,0.2)",
+      border: "2px solid transparent",
+      borderRadius: "8px",
+      cursor: "pointer",
+      color: "inherit",
+      textAlign: "left",
+    });
+
+    const img = document.createElement("img");
+    img.src = src.thumbnail;
+    Object.assign(img.style, {
+      width: "100%",
+      height: "100px",
+      objectFit: "contain",
+      background: "#1e1f22",
+      borderRadius: "4px",
+    });
+
+    const label = document.createElement("div");
+    label.textContent = src.name || (src.isScreen ? "Screen" : "Window");
+    Object.assign(label.style, {
+      fontSize: "12px",
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+    });
+
+    tile.append(img, label);
+    tile.addEventListener("click", () => {
+      selectedId = src.id;
+      tiles.forEach((t) => (t.style.borderColor = t.dataset.id === selectedId ? "#5865F2" : "transparent"));
+      audioRow.style.opacity = src.isScreen ? "1" : "0.4";
+      audioCheckbox.disabled = !src.isScreen;
+      if (!src.isScreen) audioCheckbox.checked = false;
+    });
+    tiles.push(tile);
+    grid.appendChild(tile);
+  }
+  card.appendChild(grid);
+
+  // "Share audio" — only meaningful for a full screen (matches Discord's own
+  // picker; per-window system-audio loopback isn't reliably supported).
+  const audioRow = document.createElement("label");
+  Object.assign(audioRow.style, {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+    padding: "4px 24px 4px",
+    fontSize: "14px",
+    opacity: "0.4",
+    cursor: "pointer",
+  });
+  const audioCheckbox = document.createElement("input");
+  audioCheckbox.type = "checkbox";
+  audioCheckbox.disabled = true;
+  const audioText = document.createElement("span");
+  audioText.textContent = "Share audio";
+  audioRow.append(audioCheckbox, audioText);
+  card.appendChild(audioRow);
+
+  const footer = document.createElement("div");
+  Object.assign(footer.style, { display: "flex", justifyContent: "flex-end", gap: "10px", padding: "16px 24px 20px" });
+  const cancel = makeButton("Cancel", "#4e5058");
+  cancel.addEventListener("click", () => closeSourcePicker(null));
+  const share = makeButton("Share", "#5865F2");
+  share.addEventListener("click", () => {
+    if (!selectedId) return;
+    closeSourcePicker({ id: selectedId, withAudio: audioCheckbox.checked });
+  });
+  footer.append(cancel, share);
+  card.appendChild(footer);
+
+  overlay.appendChild(card);
+  document.documentElement.appendChild(overlay);
+}
+
+ipcRenderer.on("dr:show-source-picker", (_event, sources) => showSourcePicker(sources));
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && document.getElementById(PICKER_ID)) closeSourcePicker(null);
+});
+
 // Combine every section's CSS. Future sections (theme, fonts, custom CSS) get
 // appended here.
 function buildCss() {
@@ -904,6 +1160,7 @@ function loadSavedSettings() {
     if (background) currentBackground = background;
     else if (image) currentBackground = { type: "image", url: image }; // legacy
     applyStyles();
+    sendStreamConfig(); // best-effort now; resent once webpack reports ready (see the "dr-wp" listener)
   });
 }
 
@@ -1033,6 +1290,11 @@ function runButtonAction(action, btn) {
         btn.disabled = false;
       }, 1500);
     });
+  }
+  if (action === "reload") {
+    btn.disabled = true;
+    btn.textContent = "Reloading…";
+    ipcRenderer.send("dr:reload");
   }
 }
 
@@ -1212,6 +1474,26 @@ function renderControl(ctrl) {
     return renderSpotify(wrap);
   }
 
+  if (ctrl.type === "streamStatus") {
+    wrap.appendChild(controlLabel(ctrl.label));
+    const box = document.createElement("div");
+    Object.assign(box.style, {
+      padding: "14px 16px",
+      borderRadius: "8px",
+      background: "rgba(0, 0, 0, 0.25)",
+      border: "1px solid rgba(255, 255, 255, 0.08)",
+      fontSize: "14px",
+      color: "var(--text-normal, #dbdee1)",
+    });
+    const render = (status) => {
+      box.textContent = streamStatusText(status);
+    };
+    render(latestStreamStatus);
+    streamStatusListeners.push(render); // cleared in hidePage()
+    wrap.appendChild(box);
+    return wrap;
+  }
+
   if (ctrl.type === "select") {
     wrap.appendChild(controlLabel(ctrl.label));
     const select = document.createElement("select");
@@ -1227,7 +1509,7 @@ function renderControl(ctrl) {
     ctrl.choices.forEach((choice) => {
       const opt = document.createElement("option");
       opt.value = choice;
-      opt.textContent = choice;
+      opt.textContent = (ctrl.labels && ctrl.labels[choice]) || choice;
       if (choice === val(ctrl.id)) opt.selected = true;
       select.appendChild(opt);
     });
@@ -1344,6 +1626,7 @@ function hidePage() {
   hiddenContent = [];
   pageIntervals.forEach(clearInterval);
   pageIntervals = [];
+  streamStatusListeners = [];
   setActiveItem(null);
 }
 

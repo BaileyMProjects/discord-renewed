@@ -4,10 +4,12 @@
 // Discord's internal module system (webpackChunkdiscord_app). It is the
 // foundation for "unlock" features that need to modify Discord's own code.
 //
-// STEP 1 (this file, for now): capture Discord's module `require`, expose a small
-// search API to find modules by shape (not by hashed IDs, which change every
-// update), and self-test by finding a well-known module. NOTHING is patched yet —
-// this stage is purely read-only, equivalent to poking around in devtools.
+// Capture Discord's module `require`, expose a search API to find modules by
+// shape (not by hashed IDs, which change every Discord update), and — gated
+// behind an explicit opt-in — patch the screen-share/Go Live quality ceiling
+// (resolution, framerate, bitrate). The patch only runs when preload sends
+// {enabled:true} (the "streamUnlock" toggle, OFF by default with an in-UI ToS
+// warning); until then this file is purely read-only.
 //
 // It talks back to preload over window.postMessage (both worlds share the frame),
 // every message tagged {source:"dr-wp"} so it never collides with Discord's own.
@@ -149,9 +151,10 @@
   window.__drWebpack = api;
 
   // -------------------------------------------------------------------------
-  // Self-test (STEP 1 verification). Once require is captured, wait briefly for
-  // modules to populate, then report the module count and whether we can find a
-  // couple of well-known modules. Read the result in the terminal logs.
+  // Self-test. Once require is captured, wait briefly for modules to populate,
+  // then report the module count and whether we can find a couple of well-known
+  // modules. Read the result in the terminal logs; preload also uses the "ok"
+  // status to know it's safe to (re)send the stream-unlock config.
   // -------------------------------------------------------------------------
 
   function onRequire() {
@@ -179,16 +182,198 @@
   }
 
   // -------------------------------------------------------------------------
-  // Command channel from preload (used in later steps for the stream-unlock
-  // config). For STEP 1 we just acknowledge so the bridge is proven end-to-end.
+  // Stream-quality unlock (screen share / Go Live resolution, framerate,
+  // bitrate). Gated: applyStreamUnlock() only patches anything when
+  // config.enabled is true. Targets are found by CODE SIGNATURE (substring
+  // match on each module factory's own source, via Function.prototype.toString)
+  // rather than by module id — ids are volatile and reshuffle on every Discord
+  // build, but the real (non-minified) method names on these classes
+  // (setGoLiveSource, setQualityOverwrite, setGoliveQuality) are stable enough
+  // to match reliably. Mapped 2026-07-04 against the live client:
+  //   - the RTC connection class: setGoLiveSource(e) destructures
+  //     e.quality.{resolution,frameRate} — this is what the Go Live/camera
+  //     panel asks for, before Discord's own Nitro-tier UI even limits the
+  //     choices, so overriding it here bypasses that limit regardless of what
+  //     was selected in the UI.
+  //   - the VideoQualityManager class: setQualityOverwrite(e) and
+  //     setGoliveQuality(e) carry {bitrateMin,bitrateMax,capture,encode} — the
+  //     actual ceiling the encoder is allowed to use.
+  // If a future Discord update renames/restructures these, the matchers below
+  // simply fail to find a class and the feature reports "inactive" — nothing
+  // else breaks (every hook is wrapped in try/catch and never modifies
+  // anything unless config.enabled is true).
+  // -------------------------------------------------------------------------
+
+  function moduleSource(id) {
+    try {
+      return Function.prototype.toString.call(wreq.m[id]);
+    } catch {
+      return "";
+    }
+  }
+
+  // Instantiate module `id` and find which export (or the module itself) is a
+  // class exposing `methodName` on its prototype.
+  function classWithMethod(id, methodName) {
+    let exp;
+    try {
+      exp = wreq(id);
+    } catch {
+      return null;
+    }
+    if (!exp) return null;
+    if (typeof exp === "function" && exp.prototype && typeof exp.prototype[methodName] === "function") return exp;
+    for (const k of Object.keys(exp)) {
+      const v = exp[k];
+      if (typeof v === "function" && v.prototype && typeof v.prototype[methodName] === "function") return v;
+    }
+    return null;
+  }
+
+  function findConnectionClass() {
+    if (!wreq || !wreq.m) return null;
+    for (const id in wreq.m) {
+      const src = moduleSource(id);
+      if (src.includes("setTransportOptions") && src.includes("setGoLiveSource") && src.includes("videoQualityManager")) {
+        const cls = classWithMethod(id, "setGoLiveSource");
+        if (cls) return cls;
+      }
+    }
+    return null;
+  }
+
+  function findQualityManagerClass() {
+    if (!wreq || !wreq.m) return null;
+    for (const id in wreq.m) {
+      const src = moduleSource(id);
+      if (src.includes("setQualityOverwrite") && src.includes("setGoliveQuality")) {
+        const cls = classWithMethod(id, "setQualityOverwrite");
+        if (cls) return cls;
+      }
+    }
+    return null;
+  }
+
+  let streamConfig = null; // last config received from preload: {enabled,resolution,fps,bitrateKbps}
+  let streamPatches = []; // restore functions for the currently-applied patches
+
+  function currentTargets() {
+    const cfg = streamConfig || {};
+    return {
+      res: cfg.resolution || 2160,
+      fps: cfg.fps || 60,
+      bitrate: (cfg.bitrateKbps || 8000) * 1000,
+    };
+  }
+
+  // Wrap cls.prototype[method], remembering how to put the original back.
+  function patchMethod(cls, method, makeWrapper) {
+    if (!cls || typeof cls.prototype[method] !== "function") return false;
+    const orig = cls.prototype[method];
+    cls.prototype[method] = makeWrapper(orig);
+    streamPatches.push(() => {
+      cls.prototype[method] = orig;
+    });
+    return true;
+  }
+
+  function unpatchStream() {
+    for (const restore of streamPatches) {
+      try {
+        restore();
+      } catch {}
+    }
+    streamPatches = [];
+  }
+
+  function applyStreamUnlock(config) {
+    streamConfig = config;
+
+    if (!config || !config.enabled) {
+      const wasActive = streamPatches.length > 0;
+      unpatchStream();
+      send({ type: "stream-status", status: { active: false, reason: wasActive ? "disabled" : "off" } });
+      return;
+    }
+
+    if (!wreq) {
+      send({ type: "stream-status", status: { active: false, reason: "webpack not ready" } });
+      return;
+    }
+
+    if (streamPatches.length > 0) {
+      // Already patched this session — target values are read live via
+      // currentTargets() on every call, so changing them needs no re-wrapping.
+      send({ type: "stream-status", status: { active: true } });
+      return;
+    }
+
+    const ConnClass = findConnectionClass();
+    const VQMClass = findQualityManagerClass();
+    if (!ConnClass && !VQMClass) {
+      send({ type: "stream-status", status: { active: false, reason: "modules not found" } });
+      return;
+    }
+
+    const patchedGoLiveSource = patchMethod(ConnClass, "setGoLiveSource", (orig) => function (e) {
+      try {
+        if (e && e.quality) {
+          const { res, fps } = currentTargets();
+          e = Object.assign({}, e, { quality: Object.assign({}, e.quality, { resolution: res, frameRate: fps }) });
+        }
+      } catch (err) {
+        log("setGoLiveSource override failed:", err && err.message);
+      }
+      return orig.call(this, e);
+    });
+
+    const patchedQualityOverwrite = patchMethod(VQMClass, "setQualityOverwrite", (orig) => function (e) {
+      try {
+        const { bitrate } = currentTargets();
+        e = Object.assign({}, e, { bitrateMin: Math.round(bitrate * 0.6), bitrateMax: bitrate });
+      } catch (err) {
+        log("setQualityOverwrite override failed:", err && err.message);
+      }
+      return orig.call(this, e);
+    });
+
+    const patchedGoliveQuality = patchMethod(VQMClass, "setGoliveQuality", (orig) => function (e) {
+      try {
+        const { res, fps, bitrate } = currentTargets();
+        const width = Math.round((res * 16) / 9);
+        e = Object.assign({}, e, {
+          bitrateMin: Math.round(bitrate * 0.6),
+          bitrateMax: bitrate,
+          capture: Object.assign({}, e && e.capture, { width, height: res, framerate: fps }),
+          encode: Object.assign({}, e && e.encode, { width, height: res, framerate: fps }),
+        });
+      } catch (err) {
+        log("setGoliveQuality override failed:", err && err.message);
+      }
+      return orig.call(this, e);
+    });
+
+    const active = patchedGoLiveSource || patchedQualityOverwrite || patchedGoliveQuality;
+    const status = {
+      active,
+      conn: patchedGoLiveSource,
+      overwrite: patchedQualityOverwrite,
+      golive: patchedGoliveQuality,
+    };
+    log("stream unlock:", JSON.stringify(status));
+    send({ type: "stream-status", status });
+  }
+
+  // -------------------------------------------------------------------------
+  // Command channel from preload: the persisted stream-unlock config, sent on
+  // load and whenever the user changes a setting.
   // -------------------------------------------------------------------------
 
   window.addEventListener("message", (e) => {
     const d = e.data;
     if (!d || d.source !== "dr-wp-cmd") return;
     if (d.type === "config") {
-      log("received config (no-op in step 1):", JSON.stringify(d.config || {}));
-      send({ type: "ack" });
+      applyStreamUnlock(d.config);
     }
   });
 
