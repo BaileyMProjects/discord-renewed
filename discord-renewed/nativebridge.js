@@ -182,6 +182,8 @@
         isAlwaysOnTop: function () { return false; },
         isMaximized: function () { return false; },
         isFullscreen: function () { return false; },
+        setMinimumSize: function () {},
+        setMaximumSize: function () {},
       },
       emitterMethods()
     )
@@ -342,6 +344,9 @@
     getCPUCoreCount: function () { return (navigator && navigator.hardwareConcurrency) || 4; },
     getProcessUptime: function () { return 0; },
     getMemoryInfo: function () { return Promise.resolve({}); },
+    getUsedHeapSize: function () { return 0; },
+    getSystemInfo: function () { return {}; },
+    getMainArgvSync: function () { return []; },
     // Returns a PROMISE — Sentry init awaits the last-crash info; undefined broke it.
     getLastCrash: function () { return Promise.resolve(null); },
     purgeMemory: function () {},
