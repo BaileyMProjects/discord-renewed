@@ -50,11 +50,16 @@ function createWindow() {
     frame: false,
     backgroundColor: "#1e1f22", // avoid a white flash before Discord paints
     webPreferences: {
-      // Security defaults — we keep Node out of the Discord page itself.
-      // Our customization runs in the preload script below, NOT in Discord's
-      // own code, so Discord never gets access to Node.
+      // Discord's page still gets NO direct Node access (nodeIntegration off,
+      // context isolated). But we turn the preload's own sandbox OFF so the
+      // preload can require Node modules — specifically Discord's REAL prebuilt
+      // native addons (erlpack/voice/krisp/…), which it then exposes to the page
+      // through contextBridge. This mirrors how the real desktop client works and
+      // is required for the native-desktop-parity ("desktopSpoof") feature. The
+      // page itself remains isolated from Node.
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: false,
       // Run our script inside the Discord page (this is the safe bridge).
       preload: path.join(__dirname, "preload.js"),
     },
@@ -84,6 +89,14 @@ function createWindow() {
       else win.webContents.openDevTools({ mode: "detach" });
     }
   });
+
+  // Surface renderer crashes/hangs in our terminal — otherwise a native-module
+  // crash (e.g. from the desktop-spoof bridge) just shows a blank window with no
+  // clue why. These are diagnostics; they don't change behavior.
+  win.webContents.on("render-process-gone", (_e, details) => {
+    console.log("[DiscordRenewed] RENDERER GONE:", JSON.stringify(details));
+  });
+  win.webContents.on("unresponsive", () => console.log("[DiscordRenewed] renderer unresponsive"));
 
   // Load the real Discord web app, using our Chrome-like user agent.
   win.loadURL("https://discord.com/app", { userAgent: CHROME_USER_AGENT });

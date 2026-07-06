@@ -46,6 +46,7 @@
     log("unimplemented:", path);
   }
 
+
   // A deep auto-stub: any property access returns another auto-stub (so long
   // chains like DiscordNative.x.y.z never throw), and calling it returns
   // undefined. Used as the FALLBACK for anything we haven't explicitly typed.
@@ -232,9 +233,61 @@
   // throws on erlpack.pack(...).buffer). Real rendering therefore depends on the
   // Phase 4 native-module bridge (confirmed: Discord's real .node addons load
   // under our Electron 43). Until then this whole shim is gated OFF by default.
+  // Safe main-world stubs for native modules we don't (yet) bridge as real
+  // addons, covering the methods Discord calls during boot with correct return
+  // types (Promises where it awaits). Unknown methods fall back to autoStub.
+  var MODULE_STUBS = {
+    discord_utils: {
+      getGPUDriverVersions: function () { return Promise.resolve({}); },
+      getDiscordMemoryUsage: function () { return 0; },
+      getDiscordMemoryUsageElectronRenderer: function () { return 0; },
+      isSystemDarkMode: function () { return true; },
+      getDiscordIsElevated: function () { return false; },
+      isHardwareAcceleratedGPUSchedulingEnabled: function () { return false; },
+      nativePermssionHasAuthorization: function () { return true; },
+      shouldDisplayNotifications: function () { return true; },
+      setGameCandidateOverrides: function () {},
+    },
+    discord_media: {
+      getSystemAnalyticsBlob: function () { return Promise.resolve({}); },
+      getMemoryUsageBlob: function () { return Promise.resolve({}); },
+      getGpuStats: function () { return Promise.resolve({}); },
+    },
+  };
+
+  // Native modules we report as UNAVAILABLE (requireModule → null) so Discord
+  // takes its non-native fallback. discord_zstd: fall back to zlib-stream gateway
+  // compression (bridging the real native streaming decompressor crashed the
+  // renderer). Returning null — NOT a stub — is what makes Discord pick the
+  // fallback rather than assume the module works.
+  var NULL_MODULES = { discord_zstd: 1 };
+
   var nativeModulesShim = typed("nativeModules", {
     requireModule: function (name) {
-      logOnce("nativeModules.requireModule(" + name + ")");
+      if (NULL_MODULES[name]) {
+        logOnce("nativeModules.requireModule(" + name + ") -> null (fallback)");
+        return null;
+      }
+      // Prefer a REAL native module bridged from the preload (see
+      // native-modules.js + setupNativeModuleBridge in preload.js). erlpack must
+      // be real for the gateway to connect; others fall back to autoStub until
+      // they're bridged in later phases.
+      var bridge = window.__drNativeBridge;
+      if (bridge && bridge.availableModules && bridge.availableModules.indexOf(name) !== -1) {
+        var real = bridge.requireModule(name);
+        if (real) {
+          logOnce("nativeModules.requireModule(" + name + ") -> real");
+          // Wrap so bridged (real) methods pass through, but any method we didn't
+          // bridge falls back to a safe auto-stub instead of throwing "not a
+          // function" — Discord calls methods beyond the curated allowlist.
+          return typed("nativeModules[" + name + "]", real);
+        }
+      }
+      if (MODULE_STUBS[name]) {
+        logOnce("nativeModules.requireModule(" + name + ") -> jsstub");
+        return typed("nativeModules[" + name + "]", MODULE_STUBS[name]);
+      }
+      logOnce("nativeModules.requireModule(" + name + ") -> stub");
       return autoStub("nativeModules[" + name + "]");
     },
     ensureModule: function () { return Promise.resolve(); },
@@ -286,12 +339,17 @@
 
   var processUtilsShim = typed("processUtils", {
     getCurrentCPUUsagePercent: function () { return 0; },
+    getCPUCoreCount: function () { return (navigator && navigator.hardwareConcurrency) || 4; },
+    getProcessUptime: function () { return 0; },
     getMemoryInfo: function () { return Promise.resolve({}); },
+    // Returns a PROMISE — Sentry init awaits the last-crash info; undefined broke it.
+    getLastCrash: function () { return Promise.resolve(null); },
     purgeMemory: function () {},
     flushDNSCache: function () {},
     flushCookies: function () {},
     flushStorageData: function () {},
     setCrashInterceptCallback: function () {},
+    setMemoryInformation: function () {},
   });
 
   // The full DiscordNative object. Members we haven't concretely implemented get

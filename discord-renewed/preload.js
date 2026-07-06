@@ -7,28 +7,14 @@
 // control auto-saves to the persistent store and auto-applies. To add a new
 // customization, add an entry to SCHEMA and (if needed) a line to buildCss().
 
-const { ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer } = require("electron");
 
-// Inject our MAIN-WORLD scripts into Discord's page context. Our preload lives in
-// an isolated world and can't see (or define globals on) Discord's own window, so
+// Inject a MAIN-WORLD script into Discord's page context. Our preload lives in an
+// isolated world and can't see (or define globals on) Discord's own window, so
 // these have to run as page <script>s. We do it at the very top of preload
 // (document-start) so they're in place BEFORE Discord's bundle loads. Discord's
-// CSP is stripped in main.js, so the inline scripts run. NOTE: this preload is
-// sandboxed, so it can't require("fs") — the main process reads each source and
-// hands it over synchronously via sendSync.
-//
-// ORDER MATTERS: the DiscordNative shim (nativebridge.js) goes first, so the
-// `window.DiscordNative` global exists before anything else, making Discord's own
-// code render the full desktop feature set. Then the webpack patcher (webpack.js).
-function injectMainWorldScript(channel, label) {
-  let code;
-  try {
-    code = ipcRenderer.sendSync(channel);
-  } catch (e) {
-    return console.log(`[DiscordRenewed] ${label} source failed:`, e && e.message);
-  }
-  if (!code) return console.log(`[DiscordRenewed] ${label} source empty`);
-
+// CSP is stripped in main.js, so the inline scripts run.
+function injectSourceIntoMainWorld(code, label) {
   const run = () => {
     const root = document.documentElement || document.head || document.body;
     if (!root) return false; // <html> not created yet — try again when it is
@@ -53,8 +39,62 @@ function injectMainWorldScript(channel, label) {
   }
 }
 
-injectMainWorldScript("dr:get-native-bridge-source", "native bridge");
-injectMainWorldScript("dr:get-patcher-source", "patcher");
+// Fetch a main-world script's source from the main process (the preload can't
+// read files reliably itself) and inject it.
+function fetchAndInject(channel, label) {
+  let code;
+  try {
+    code = ipcRenderer.sendSync(channel);
+  } catch (e) {
+    return console.log(`[DiscordRenewed] ${label} source failed:`, e && e.message);
+  }
+  if (!code) return console.log(`[DiscordRenewed] ${label} source empty`);
+  injectSourceIntoMainWorld(code, label);
+}
+
+// Expose Discord's REAL native modules (loaded in this now-unsandboxed preload's
+// Node context) to the page over contextBridge, so the DiscordNative shim's
+// `nativeModules.requireModule(name)` can hand back genuine addons (erlpack, etc.)
+// instead of inert stubs. Functions are proxied across the isolated↔main-world
+// boundary; calls run here in the preload (same process → no IPC hop).
+function setupNativeModuleBridge() {
+  try {
+    const native = require("./native-modules").load();
+    const names = Object.keys(native.modules);
+    contextBridge.exposeInMainWorld("__drNativeBridge", {
+      availableModules: names,
+      requireModule: (name) => native.modules[name] || null,
+    });
+    console.log(
+      "[DiscordRenewed][native] bridged modules:",
+      names.join(", ") || "(none)",
+      "@",
+      native.dir || "(Discord install not found)"
+    );
+  } catch (e) {
+    console.log("[DiscordRenewed][native] bridge setup failed:", e && e.message);
+  }
+}
+
+// The native-desktop spoof is opt-in (settings key `desktopSpoof`). main.js only
+// returns the shim source when it's enabled, so an empty result = spoof OFF and
+// we do nothing extra (normal web client). When ON, we ALSO bridge the real
+// native modules, then inject the DiscordNative shim FIRST (so the global exists
+// before anything else), and finally the webpack patcher.
+const nativeBridgeSource = (() => {
+  try {
+    return ipcRenderer.sendSync("dr:get-native-bridge-source");
+  } catch (e) {
+    console.log("[DiscordRenewed] native bridge source failed:", e && e.message);
+    return "";
+  }
+})();
+
+if (nativeBridgeSource) {
+  setupNativeModuleBridge();
+  injectSourceIntoMainWorld(nativeBridgeSource, "native bridge");
+}
+fetchAndInject("dr:get-patcher-source", "patcher");
 
 // Bridge for messages coming back from the main-world patcher (webpack.js).
 let webpackStatus = null; // last { ok, moduleCount, ... } reported by the patcher
