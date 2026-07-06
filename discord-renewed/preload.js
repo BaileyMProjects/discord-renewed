@@ -90,11 +90,36 @@ const nativeBridgeSource = (() => {
   }
 })();
 
-if (nativeBridgeSource) {
+// True when the native-desktop spoof is active this launch. main.js only returns
+// the shim source when the `desktopSpoof` setting is on, so a non-empty source
+// doubles as the flag. Used to suppress our hand-drawn title bar (Discord renders
+// its own desktop one under the spoof) and to enable the native-command bridge.
+const desktopSpoof = Boolean(nativeBridgeSource);
+
+if (desktopSpoof) {
   setupNativeModuleBridge();
   injectSourceIntoMainWorld(nativeBridgeSource, "native bridge");
 }
 fetchAndInject("dr:get-patcher-source", "patcher");
+
+// Bridge for commands the DiscordNative shim (main world) posts to us — it can't
+// do IPC itself, so it postMessages {source:"dr-native-cmd", type, payload} and we
+// relay to the main process. This is what makes Discord's OWN desktop title bar
+// buttons (and other DiscordNative.window/app calls) actually work under the spoof.
+window.addEventListener("message", (e) => {
+  const d = e.data;
+  if (!d || d.source !== "dr-native-cmd") return;
+  if (d.type === "win") {
+    // payload = "minimize" | "maximize" | "restore" | "close" | "focus"
+    ipcRenderer.send("dr:win-ctl", d.payload);
+  } else if (d.type === "setBadgeCount") {
+    ipcRenderer.send("dr:set-badge", d.payload);
+  } else if (d.type === "setZoomFactor") {
+    ipcRenderer.send("dr:set-zoom", d.payload);
+  } else if (d.type === "relaunch") {
+    ipcRenderer.send("dr:relaunch");
+  }
+});
 
 // Bridge for messages coming back from the main-world patcher (webpack.js).
 let webpackStatus = null; // last { ok, moduleCount, ... } reported by the patcher
@@ -897,6 +922,9 @@ function titlebarNavButton(svg) {
 }
 
 function syncTitlebar() {
+  // Under the desktop spoof, Discord renders its OWN native title bar, so we don't
+  // draw ours (avoids a doubled bar and doubled window controls).
+  if (desktopSpoof) return;
   if (document.getElementById(TITLEBAR_ID)) return;
 
   const bar = document.createElement("div");
@@ -978,7 +1006,10 @@ function syncTitlebar() {
 
 // Reserve the title-bar strip so Discord's root sits below it, and hide Discord's
 // own (web) title bar — it has no window controls and would duplicate ours.
+// Under the desktop spoof we do NEITHER: Discord renders its own real desktop
+// title bar (with working window controls), so we leave its layout alone.
 function titlebarCss() {
+  if (desktopSpoof) return "";
   return `
     #app-mount { position: absolute !important; inset: ${TITLEBAR_H}px 0 0 0 !important; }
     [class*="bar_"]:has(> [class*="title_"]) { display: none !important; }

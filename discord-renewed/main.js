@@ -419,6 +419,42 @@ ipcMain.on("dr:open-external", (_e, url) => {
   if (typeof url === "string" && url.startsWith("https://")) shell.openExternal(url);
 });
 
+// Window controls driven by Discord's OWN desktop title bar under the spoof
+// (via DiscordNative.window.* → the dr-native-cmd bridge in preload). One
+// channel dispatches all the actions Discord's title bar uses.
+ipcMain.on("dr:win-ctl", (e, action) => {
+  const w = BrowserWindow.fromWebContents(e.sender);
+  if (!w) return;
+  switch (action) {
+    case "minimize": return w.minimize();
+    case "maximize": return w.maximize();
+    case "restore": return w.unmaximize();
+    case "close": return w.close();
+    case "focus": return w.focus();
+  }
+});
+
+// Taskbar badge / dock count (DiscordNative.app.setBadgeCount). On Windows there's
+// no numeric taskbar badge, but setting a non-zero count shows the overlay dot.
+ipcMain.on("dr:set-badge", (_e, count) => {
+  try { app.setBadgeCount(typeof count === "number" ? count : 0); } catch {}
+});
+
+ipcMain.on("dr:set-zoom", (e, percent) => {
+  // Discord restores its saved zoom via DiscordNative.window.setZoomFactor, and it
+  // passes a PERCENTAGE (100 = 100%), whereas Electron's setZoomFactor wants a
+  // ratio (1.0 = 100%) — passing 100 straight through zoomed the UI 100x. Convert.
+  const w = BrowserWindow.fromWebContents(e.sender);
+  if (w && typeof percent === "number" && percent > 0) {
+    w.webContents.setZoomFactor(percent / 100);
+  }
+});
+
+ipcMain.on("dr:relaunch", () => {
+  app.relaunch();
+  app.exit(0);
+});
+
 ipcMain.on("dr:capture-source-chosen", handleCaptureChoice);
 
 // Reload Discord's page. Used by the Streaming tab's "Reload" button: the
