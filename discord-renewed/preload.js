@@ -135,6 +135,7 @@ const SCHEMA = [
   { section: "System", id: "memory", type: "readout", label: "Memory usage" },
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
   { section: "System", id: "perfMode", type: "select", label: "Performance mode (applies after restart). Measured RAM vs Discord's ~590 MB — Smooth: full GPU, ~490 MB (~17% lighter), buttery. Optimised: GPU off, ~380 MB (~36% lighter) but video/screen-share/animation get clunkier.", choices: ["Smooth", "Optimised"], def: "Smooth" },
+  { section: "System", id: "minimizeToTray", type: "toggle", label: "Keep running in the system tray when closed (like the real Discord app), instead of quitting", def: true },
   { section: "Spotify", id: "spotify", type: "spotify", label: "Spotify" },
   { section: "Spotify", id: "dockedPlayer", type: "toggle", label: "Show a Spotify mini-player docked above your profile (pop it out with ⤢ to drag it anywhere)", def: false },
   { section: "Spotify", id: "tabColor", type: "color", label: "Mini-player background colour", def: "", defColor: "#1e1f22" },

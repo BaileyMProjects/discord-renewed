@@ -3,12 +3,20 @@
 // application window and load Discord into it. Later we'll use this same
 // process to wire up our custom settings.
 
-const { app, BrowserWindow, ipcMain, dialog, session, protocol, net, shell, screen, desktopCapturer } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, session, protocol, net, shell, screen, desktopCapturer, Tray, Menu, nativeImage } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
 const { pathToFileURL } = require("url");
 const spotify = require("./spotify");
+
+const ICON_PATH = path.join(__dirname, "assets", "icon.ico");
+
+// Windows groups notifications/taskbar entries by this ID. Without it, Electron
+// apps show up as generic "Electron" — setting our own AppUserModelID is what
+// makes native Windows notifications (and the taskbar icon) read as "Discord
+// Renewed" instead. Must be set before window/notification creation.
+app.setAppUserModelId("com.baileymontoya.discordrenewed");
 
 // Register a private URL scheme we use to stream background VIDEOS straight
 // from disk. Images are small enough to hand to the page as base64 data URLs,
@@ -35,6 +43,7 @@ function createWindow() {
     width: 1280,
     height: 800,
     title: "Discord Renewed",
+    icon: ICON_PATH,
     // Frameless: drop the OS title bar + window buttons. We draw our own
     // Discord-style title bar in the page (see syncTitlebar in preload.js) so the
     // window doesn't look like a browser tab. Still resizable from the edges.
@@ -52,11 +61,27 @@ function createWindow() {
   });
 
   // Forward the page's console output to our terminal so we can see what the
-  // preload script reports (temporary debugging aid).
+  // preload script reports (temporary debugging aid). Also forward warnings/
+  // errors from Discord's OWN code (not just our "[DiscordRenewed]"-tagged
+  // logs) — otherwise a real failure (e.g. a thrown error when Go Live fails)
+  // is invisible to us since DevTools may not be reachable.
   win.webContents.on("console-message", (e, level, message) => {
-    const text = message !== undefined ? message : e && e.message;
-    if (typeof text === "string" && text.includes("[DiscordRenewed]")) {
-      console.log(text);
+    const lvl = typeof level === "number" ? level : e && e.level;
+    const text = typeof message === "string" ? message : e && e.message;
+    if (typeof text !== "string") return;
+    if (text.includes("[DiscordRenewed]") || lvl >= 3) console.log(text);
+  });
+
+  // Our frameless window has no menu bar, and without an application Menu set,
+  // Electron doesn't register the usual Ctrl+Shift+I/F12 devtools accelerators
+  // — so wire them up ourselves directly on the window's key events.
+  win.webContents.on("before-input-event", (_event, input) => {
+    if (input.type !== "keyDown") return;
+    const key = input.key.toLowerCase();
+    if (key === "f12" || ((input.control || input.meta) && input.shift && key === "i")) {
+      console.log("[DiscordRenewed] devtools shortcut caught, isDevToolsOpened=", win.webContents.isDevToolsOpened());
+      if (win.webContents.isDevToolsOpened()) win.webContents.closeDevTools();
+      else win.webContents.openDevTools({ mode: "detach" });
     }
   });
 
@@ -394,6 +419,58 @@ function stripContentSecurityPolicy() {
 }
 
 // ---------------------------------------------------------------------------
+// System tray. Closing the window (the X button) minimizes to tray instead of
+// quitting, like the real Discord desktop app — the window just hides, the
+// process keeps running so calls/notifications keep coming, and the tray icon
+// brings it back. Controlled by the "minimizeToTray" setting (default on);
+// the actual quit path (tray menu, Alt+F4-then-confirm, OS shutdown) sets
+// isQuitting first so the close handler lets it through instead of hiding.
+// ---------------------------------------------------------------------------
+
+let isQuitting = false;
+app.on("before-quit", () => {
+  isQuitting = true;
+});
+
+function setupTray(win) {
+  const tray = new Tray(nativeImage.createFromPath(ICON_PATH));
+  tray.setToolTip("Discord Renewed");
+
+  const showWindow = () => {
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  };
+
+  const menu = Menu.buildFromTemplate([
+    { label: "Open Discord Renewed", click: showWindow },
+    { type: "separator" },
+    { label: "Quit Discord Renewed", click: () => app.quit() },
+  ]);
+
+  // Left-click toggles the window; right-click shows the menu. (We don't call
+  // tray.setContextMenu() — on Windows that also pops the menu on left-click,
+  // which isn't what we want here.)
+  tray.on("click", () => {
+    if (win.isVisible() && !win.isMinimized()) win.hide();
+    else showWindow();
+  });
+  tray.on("right-click", () => tray.popUpContextMenu(menu));
+  tray.on("double-click", showWindow);
+
+  win.on("close", (e) => {
+    const s = readSettings();
+    const minimizeToTray = s.minimizeToTray !== false; // default on
+    if (!isQuitting && minimizeToTray) {
+      e.preventDefault();
+      win.hide();
+    }
+  });
+
+  return tray;
+}
+
+// ---------------------------------------------------------------------------
 // Screen/window share. We load Discord's real WEB app, which calls the
 // standard navigator.mediaDevices.getDisplayMedia() for Go Live/screenshare —
 // that works in a real browser tab because Chrome supplies its own OS picker,
@@ -520,7 +597,8 @@ if (!gotLock) {
 
     stripContentSecurityPolicy();
     setupScreenShareHandler();
-    createWindow();
+    const win = createWindow();
+    setupTray(win);
 
     // On macOS, apps usually stay open with no windows; re-create one when the
     // dock icon is clicked and there are none. (Harmless on Windows.)
@@ -530,7 +608,9 @@ if (!gotLock) {
   });
 }
 
-// On Windows/Linux, quit the app once every window is closed.
+// On Windows/Linux, quit the app once every window is closed. With the tray
+// wired up, "close" hides instead of destroying the window (see setupTray),
+// so this now only fires on a real quit (tray menu, or minimizeToTray off).
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
