@@ -9,6 +9,7 @@ const fs = require("fs");
 const { execFile } = require("child_process");
 const { pathToFileURL } = require("url");
 const spotify = require("./spotify");
+const { RpcServer } = require("./rpc");
 
 const ICON_PATH = path.join(__dirname, "assets", "icon.ico");
 
@@ -540,6 +541,32 @@ function setupTray(win) {
 }
 
 // ---------------------------------------------------------------------------
+// Rich Presence (Discord RPC). Only under the desktop spoof — the web app tries
+// to run the RPC server via the native discord_rpc module (which we can't bridge
+// cleanly), so we run our own IPC pipe server (rpc.js) and forward received
+// activities to the renderer, which injects them into Discord via webpack. Games
+// / apps that use discord-rpc / the Game SDK connect to the pipe and set presence.
+// ---------------------------------------------------------------------------
+let rpcServer = null;
+function setupRichPresence(win) {
+  if (readSettings().desktopSpoof !== true) return; // spoof-only feature
+  rpcServer = new RpcServer();
+  rpcServer.on("activity", (data) => {
+    // { clientId, pid, activity, socketId } → renderer injects it into Discord.
+    console.log("[DiscordRenewed][rpc] activity from", data.clientId, "-", data.activity && data.activity.details, data.activity && data.activity.state);
+    win.webContents.send("dr:rpc-activity", data);
+  });
+  rpcServer.on("activity-clear", (data) => {
+    win.webContents.send("dr:rpc-activity", { socketId: data.socketId, activity: null, clear: true });
+  });
+  try {
+    rpcServer.start();
+  } catch (err) {
+    console.error("[DiscordRenewed][rpc] failed to start:", err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Screen/window share. We load Discord's real WEB app, which calls the
 // standard navigator.mediaDevices.getDisplayMedia() for Go Live/screenshare —
 // that works in a real browser tab because Chrome supplies its own OS picker,
@@ -668,6 +695,7 @@ if (!gotLock) {
     setupScreenShareHandler();
     const win = createWindow();
     setupTray(win);
+    setupRichPresence(win);
 
     // On macOS, apps usually stay open with no windows; re-create one when the
     // dock icon is clicked and there are none. (Harmless on Windows.)

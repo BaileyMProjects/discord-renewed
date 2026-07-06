@@ -121,6 +121,13 @@ window.addEventListener("message", (e) => {
   }
 });
 
+// Relay Rich Presence activities from our main-process RPC server (rpc.js) into
+// Discord's main world, where the patcher (webpack.js) injects them as the user's
+// presence via Discord's own LOCAL_ACTIVITY_UPDATE flux action.
+ipcRenderer.on("dr:rpc-activity", (_e, data) => {
+  window.postMessage({ source: "dr-rpc", ...data }, "*");
+});
+
 // Bridge for messages coming back from the main-world patcher (webpack.js).
 let webpackStatus = null; // last { ok, moduleCount, ... } reported by the patcher
 let latestStreamStatus = null; // last { active, reason? } reported for the stream-quality unlock

@@ -365,15 +365,78 @@
   }
 
   // -------------------------------------------------------------------------
+  // Rich Presence injection. Our main-process RPC server (rpc.js) receives
+  // SET_ACTIVITY from games/apps and forwards it here (via preload → postMessage
+  // "dr-rpc"). We inject it as the user's presence using Discord's OWN
+  // LOCAL_ACTIVITY_UPDATE flux action — the same one the real client fires when
+  // its native RPC server gets an activity.
+  // -------------------------------------------------------------------------
+
+  let fluxDispatcher = null;
+  function getFluxDispatcher() {
+    if (fluxDispatcher) return fluxDispatcher;
+    // The dispatcher has this distinctive method trio.
+    fluxDispatcher = findByProps("dispatch", "subscribe", "wait");
+    return fluxDispatcher;
+  }
+
+  // Cache app id → display name (needed for the presence to read correctly).
+  const rpcAppNames = Object.create(null);
+  function fetchAppName(clientId) {
+    if (!clientId) return Promise.resolve(null);
+    if (rpcAppNames[clientId] !== undefined) return Promise.resolve(rpcAppNames[clientId]);
+    return fetch("https://discord.com/api/v9/applications/" + clientId + "/rpc")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => (rpcAppNames[clientId] = (j && j.name) || null))
+      .catch(() => (rpcAppNames[clientId] = null));
+  }
+
+  function dispatchActivity(data, name) {
+    const Flux = getFluxDispatcher();
+    if (!Flux || typeof Flux.dispatch !== "function") {
+      log("[rpc] FluxDispatcher not found; cannot set presence");
+      return;
+    }
+    let activity = null;
+    if (data.activity) {
+      activity = Object.assign({}, data.activity, {
+        application_id: data.clientId,
+        name: data.activity.name || name || "Game",
+        type: typeof data.activity.type === "number" ? data.activity.type : 0,
+        flags: 1,
+      });
+    }
+    try {
+      Flux.dispatch({
+        type: "LOCAL_ACTIVITY_UPDATE",
+        activity: activity,
+        socketId: String(data.socketId != null ? data.socketId : "dr"),
+        pid: data.pid,
+      });
+      log("[rpc] LOCAL_ACTIVITY_UPDATE " + (activity ? activity.name : "(cleared)"));
+    } catch (err) {
+      log("[rpc] dispatch failed: " + (err && err.message));
+    }
+  }
+
+  function applyRpcActivity(data) {
+    // Clearing (disconnect) needs no name lookup.
+    if (!data.activity) return dispatchActivity(data, null);
+    fetchAppName(data.clientId).then((name) => dispatchActivity(data, name));
+  }
+
+  // -------------------------------------------------------------------------
   // Command channel from preload: the persisted stream-unlock config, sent on
-  // load and whenever the user changes a setting.
+  // load and whenever the user changes a setting; plus RPC activities.
   // -------------------------------------------------------------------------
 
   window.addEventListener("message", (e) => {
     const d = e.data;
-    if (!d || d.source !== "dr-wp-cmd") return;
-    if (d.type === "config") {
+    if (!d) return;
+    if (d.source === "dr-wp-cmd" && d.type === "config") {
       applyStreamUnlock(d.config);
+    } else if (d.source === "dr-rpc") {
+      applyRpcActivity(d);
     }
   });
 
