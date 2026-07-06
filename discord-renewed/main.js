@@ -173,17 +173,37 @@ function backgroundResource(settings) {
   return resourceForFile(settings.backgroundFile);
 }
 
-// The preload is sandboxed (no fs), so it can't read our main-world patcher script
-// itself. We read it here and hand the source over synchronously at document-start,
-// where the preload injects it into Discord's page context. Read fresh each launch
-// so edits to webpack.js take effect on restart.
-ipcMain.on("dr:get-patcher-source", (event) => {
+// The preload is sandboxed (no fs), so it can't read our main-world scripts
+// itself. We read them here and hand the source over synchronously at
+// document-start, where the preload injects them into Discord's page context.
+// Read fresh each launch so edits take effect on restart.
+function readInjectedSource(file) {
   try {
-    event.returnValue = fs.readFileSync(path.join(__dirname, "webpack.js"), "utf8");
+    return fs.readFileSync(path.join(__dirname, file), "utf8");
   } catch (err) {
-    console.error("[DiscordRenewed] failed to read patcher source:", err.message);
-    event.returnValue = "";
+    console.error(`[DiscordRenewed] failed to read ${file}:`, err.message);
+    return "";
   }
+}
+
+// webpack.js: the webpack patcher (main-world module access).
+ipcMain.on("dr:get-patcher-source", (event) => {
+  event.returnValue = readInjectedSource("webpack.js");
+});
+
+// nativebridge.js: the DiscordNative shim that makes Discord's web app believe
+// it's the native desktop client (unlocks the full desktop feature set). Must be
+// injected before Discord's own bundle runs.
+//
+// GATED OFF BY DEFAULT (settings key `desktopSpoof`). This is the in-progress
+// native-desktop-parity work: once DiscordNative is present Discord loads its
+// full desktop bundle, but its desktop connection path requires real native
+// modules (erlpack for the gateway, etc.) that aren't bridged yet — so with the
+// spoof ON the app currently can't finish connecting. Keeping it opt-in means
+// the normal (web) client keeps working perfectly until the bridge lands.
+ipcMain.on("dr:get-native-bridge-source", (event) => {
+  const enabled = readSettings().desktopSpoof === true;
+  event.returnValue = enabled ? readInjectedSource("nativebridge.js") : "";
 });
 
 // On startup the preload asks for the saved settings so it can re-apply them.

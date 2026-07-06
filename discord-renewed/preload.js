@@ -9,21 +9,25 @@
 
 const { ipcRenderer } = require("electron");
 
-// Inject our MAIN-WORLD patcher (webpack.js) into Discord's page context. Our
-// preload lives in an isolated world and can't see Discord's internal module
-// system, so the patcher has to run as a page <script>. We do this at the very top
-// of preload (document-start) so its webpack hook is in place before Discord's
-// bundle loads. Discord's CSP is stripped in main.js, so the inline script runs.
-// NOTE: this preload is sandboxed, so it can't require("fs") — the main process
-// reads the patcher source and hands it over synchronously via sendSync.
-(function injectMainWorldPatcher() {
+// Inject our MAIN-WORLD scripts into Discord's page context. Our preload lives in
+// an isolated world and can't see (or define globals on) Discord's own window, so
+// these have to run as page <script>s. We do it at the very top of preload
+// (document-start) so they're in place BEFORE Discord's bundle loads. Discord's
+// CSP is stripped in main.js, so the inline scripts run. NOTE: this preload is
+// sandboxed, so it can't require("fs") — the main process reads each source and
+// hands it over synchronously via sendSync.
+//
+// ORDER MATTERS: the DiscordNative shim (nativebridge.js) goes first, so the
+// `window.DiscordNative` global exists before anything else, making Discord's own
+// code render the full desktop feature set. Then the webpack patcher (webpack.js).
+function injectMainWorldScript(channel, label) {
   let code;
   try {
-    code = ipcRenderer.sendSync("dr:get-patcher-source");
+    code = ipcRenderer.sendSync(channel);
   } catch (e) {
-    return console.log("[DiscordRenewed] patcher source failed:", e && e.message);
+    return console.log(`[DiscordRenewed] ${label} source failed:`, e && e.message);
   }
-  if (!code) return console.log("[DiscordRenewed] patcher source empty");
+  if (!code) return console.log(`[DiscordRenewed] ${label} source empty`);
 
   const run = () => {
     const root = document.documentElement || document.head || document.body;
@@ -34,7 +38,7 @@ const { ipcRenderer } = require("electron");
       root.appendChild(script);
       script.remove(); // its code has already executed; keep the DOM tidy
     } catch (e) {
-      console.log("[DiscordRenewed] patcher inject error:", e && e.message);
+      console.log(`[DiscordRenewed] ${label} inject error:`, e && e.message);
     }
     return true;
   };
@@ -47,7 +51,10 @@ const { ipcRenderer } = require("electron");
     });
     obs.observe(document, { childList: true, subtree: true });
   }
-})();
+}
+
+injectMainWorldScript("dr:get-native-bridge-source", "native bridge");
+injectMainWorldScript("dr:get-patcher-source", "patcher");
 
 // Bridge for messages coming back from the main-world patcher (webpack.js).
 let webpackStatus = null; // last { ok, moduleCount, ... } reported by the patcher
