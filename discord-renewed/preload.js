@@ -121,12 +121,28 @@ window.addEventListener("message", (e) => {
   }
 });
 
-// Relay Rich Presence activities from our main-process RPC server (rpc.js) into
-// Discord's main world, where the patcher (webpack.js) injects them as the user's
-// presence via Discord's own LOCAL_ACTIVITY_UPDATE flux action.
-ipcRenderer.on("dr:rpc-activity", (_e, data) => {
-  window.postMessage({ source: "dr-rpc", ...data }, "*");
-});
+// Rich Presence transport relay. Our main-process IPC pipe server (rpc.js) is a
+// RAW transport; Discord's own RPC code (driven through the DiscordNative shim's
+// discord_rpc facade in the main world) does the protocol. We shuttle bytes and
+// connection events between them. Only active under the desktop spoof.
+if (desktopSpoof) {
+  ipcRenderer.on("dr:rpc-evt", (_e, evt) => {
+    window.postMessage(Object.assign({ source: "dr-rpc-evt" }, evt), "*");
+  });
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || d.source !== "dr-rpc-cmd") return;
+    if (d.cmd === "listen") ipcRenderer.send("dr:rpc-listen", d.path);
+    else if (d.cmd === "write") ipcRenderer.send("dr:rpc-write", d.id, d.data);
+    else if (d.cmd === "end") ipcRenderer.send("dr:rpc-end", d.id);
+    else if (d.cmd === "destroy") ipcRenderer.send("dr:rpc-destroy", d.id);
+    else if (d.cmd === "find-slot") {
+      ipcRenderer.invoke("dr:rpc-find-slot").then((path) => {
+        window.postMessage({ source: "dr-rpc-evt", type: "slot", reqId: d.reqId, path }, "*");
+      });
+    }
+  });
+}
 
 // Bridge for messages coming back from the main-world patcher (webpack.js).
 let webpackStatus = null; // last { ok, moduleCount, ... } reported by the patcher

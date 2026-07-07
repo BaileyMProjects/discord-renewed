@@ -9,7 +9,7 @@ const fs = require("fs");
 const { execFile } = require("child_process");
 const { pathToFileURL } = require("url");
 const spotify = require("./spotify");
-const { RpcServer } = require("./rpc");
+const { RpcTransport } = require("./rpc");
 
 const ICON_PATH = path.join(__dirname, "assets", "icon.ico");
 
@@ -547,23 +547,20 @@ function setupTray(win) {
 // activities to the renderer, which injects them into Discord via webpack. Games
 // / apps that use discord-rpc / the Game SDK connect to the pipe and set presence.
 // ---------------------------------------------------------------------------
-let rpcServer = null;
+let rpcTransport = null;
 function setupRichPresence(win) {
   if (readSettings().desktopSpoof !== true) return; // spoof-only feature
-  rpcServer = new RpcServer();
-  rpcServer.on("activity", (data) => {
-    // { clientId, pid, activity, socketId } → renderer injects it into Discord.
-    console.log("[DiscordRenewed][rpc] activity from", data.clientId, "-", data.activity && data.activity.details, data.activity && data.activity.state);
-    win.webContents.send("dr:rpc-activity", data);
+  // The transport relays events to the renderer, where the DiscordNative shim's
+  // discord_rpc facade drives Discord's own RPC code.
+  rpcTransport = new RpcTransport((type, payload) => {
+    if (type === "listening") console.log("[DiscordRenewed][rpc] RPC server listening on", payload.path);
+    try { win.webContents.send("dr:rpc-evt", Object.assign({ type }, payload)); } catch {}
   });
-  rpcServer.on("activity-clear", (data) => {
-    win.webContents.send("dr:rpc-activity", { socketId: data.socketId, activity: null, clear: true });
-  });
-  try {
-    rpcServer.start();
-  } catch (err) {
-    console.error("[DiscordRenewed][rpc] failed to start:", err.message);
-  }
+  ipcMain.handle("dr:rpc-find-slot", () => rpcTransport.findFreeSlot());
+  ipcMain.on("dr:rpc-listen", (_e, path) => rpcTransport.listen(path));
+  ipcMain.on("dr:rpc-write", (_e, id, data) => rpcTransport.write(id, data));
+  ipcMain.on("dr:rpc-end", (_e, id) => rpcTransport.end(id));
+  ipcMain.on("dr:rpc-destroy", (_e, id) => rpcTransport.destroy(id));
 }
 
 // ---------------------------------------------------------------------------

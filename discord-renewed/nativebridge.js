@@ -69,6 +69,151 @@
     });
   }
 
+  // A tiny event emitter matching the shape discord_rpc's facades spread in
+  // (on/once/addListener/removeListener/removeAllListeners/emit).
+  function makeEmitter() {
+    var listeners = Object.create(null);
+    var e = {
+      on: function (n, fn) { (listeners[n] = listeners[n] || []).push(fn); return e; },
+      addListener: function (n, fn) { return e.on(n, fn); },
+      once: function (n, fn) { var g = function () { e.removeListener(n, g); fn.apply(null, arguments); }; return e.on(n, g); },
+      removeListener: function (n, fn) { if (listeners[n]) listeners[n] = listeners[n].filter(function (x) { return x !== fn; }); return e; },
+      removeAllListeners: function (n) { if (n) delete listeners[n]; else listeners = Object.create(null); return e; },
+      emit: function (n) { var a = [].slice.call(arguments, 1); (listeners[n] || []).slice().forEach(function (fn) { try { fn.apply(null, a); } catch (err) {} }); return true; },
+    };
+    return e;
+  }
+
+  // ---- discord_rpc transport facade -----------------------------------------
+  // Reimplements the discord_rpc module's transport interface (RPCIPC net server
+  // + sockets) in the page, backed by a REAL Node IPC pipe server in the main
+  // process (rpc.js) over the dr-rpc-evt/dr-rpc-cmd relay. Discord's OWN RPC code
+  // then runs the protocol (handshake, connection/app registration, presence) —
+  // which is what makes Rich Presence actually display, unlike a hand-rolled
+  // LOCAL_ACTIVITY_UPDATE. Built lazily and cached.
+  var rpcConnHandler = null; // Discord's onConnection callback for the IPC server
+  var rpcSockets = Object.create(null); // conn id -> socket facade
+  var rpcServerEmitter = null; // the IPC server's own emitter (for 'error')
+  var rpcListenCb = null; // pending server.listen callback
+  var rpcSlotResolvers = Object.create(null);
+  var rpcSlotReqId = 1;
+
+  function rpcCmd(obj) {
+    try { window.postMessage(Object.assign({ source: "dr-rpc-cmd" }, obj), "*"); } catch (e) {}
+  }
+
+  function makeRpcSocket(id) {
+    var em = makeEmitter();
+    var handshake = false;
+    var buf = new Uint8Array(0); // internal read buffer for read(len) (pull mode)
+    function recv(data) {
+      var u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+      var merged = new Uint8Array(buf.length + u8.length);
+      merged.set(buf); merged.set(u8, buf.length); buf = merged;
+      // Emit an ArrayBuffer chunk (Discord's web IPC reader works in ArrayBuffers,
+      // not Node Buffers), and also leave it buffered for read().
+      em.emit("data", u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+    }
+    var sock = {
+      setHandshakeComplete: function (b) { handshake = b; },
+      getHandshakeComplete: function () { return handshake; },
+      write: function (data) { rpcCmd({ cmd: "write", id: id, data: new Uint8Array(data.buffer || data) }); },
+      end: function (data) { if (data) rpcCmd({ cmd: "write", id: id, data: new Uint8Array(data.buffer || data) }); rpcCmd({ cmd: "end", id: id }); },
+      read: function (len) {
+        if (len == null) len = buf.length;
+        if (len === 0 || buf.length < len) return null;
+        var out = buf.slice(0, len); buf = buf.slice(len);
+        return out.buffer;
+      },
+      destroy: function () { rpcCmd({ cmd: "destroy", id: id }); em.removeAllListeners(); },
+      __recv: recv,
+    };
+    // Spread emitter methods onto the socket (matches recastNetSocket's ...emitter).
+    for (var k in em) sock[k] = em[k];
+    sock.__emit = em.emit;
+    return sock;
+  }
+
+  function makeRpcServer() {
+    var em = makeEmitter();
+    rpcServerEmitter = em;
+    var server = {
+      listening: function () { return true; },
+      address: function () { return { port: 0 }; },
+      listen: function (socketPath, onListening) {
+        rpcListenCb = onListening || null;
+        rpcCmd({ cmd: "listen", path: socketPath });
+      },
+    };
+    for (var k in em) server[k] = em[k];
+    return server;
+  }
+
+  // Events relayed from the main-process transport (rpc.js).
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (!d || d.source !== "dr-rpc-evt") return;
+    if (d.type === "connection") {
+      var sock = makeRpcSocket(d.id);
+      rpcSockets[d.id] = sock;
+      if (rpcConnHandler) { try { rpcConnHandler(sock); } catch (err) {} }
+    } else if (d.type === "data") {
+      var s = rpcSockets[d.id]; if (s) s.__recv(d.data);
+    } else if (d.type === "conn-close") {
+      var s2 = rpcSockets[d.id]; if (s2) { try { s2.__emit("close"); } catch (err) {} delete rpcSockets[d.id]; }
+    } else if (d.type === "listening") {
+      if (rpcListenCb) { var cb = rpcListenCb; rpcListenCb = null; try { cb(); } catch (err) {} }
+    } else if (d.type === "server-error") {
+      if (rpcServerEmitter) rpcServerEmitter.emit("error", new Error(d.message || "rpc error"));
+    } else if (d.type === "slot") {
+      var r = rpcSlotResolvers[d.reqId]; if (r) { r(d.path); delete rpcSlotResolvers[d.reqId]; }
+    }
+  });
+
+  var discordRpcModule = null;
+  function buildDiscordRpc() {
+    if (discordRpcModule) return discordRpcModule;
+    discordRpcModule = {
+      RPCIPC: {
+        // Discord calls this to pick a free ipc slot; we answer with one the main
+        // process can actually bind (ignoring the client-probe testFn — we bind,
+        // not connect).
+        getAvailableSocket: function () {
+          var reqId = rpcSlotReqId++;
+          return new Promise(function (resolve, reject) {
+            rpcSlotResolvers[reqId] = function (path) { path ? resolve(path) : reject(new Error("no free ipc slot")); };
+            rpcCmd({ cmd: "find-slot", reqId: reqId });
+          });
+        },
+        net: {
+          createServer: function (onConnection) {
+            rpcConnHandler = onConnection;
+            return makeRpcServer();
+          },
+        },
+      },
+      // WebSocket transport (port 6463): safe no-op stub for now — the IPC pipe is
+      // what games use. Lets Discord's WS setup complete without a real server.
+      RPCWebSocket: {
+        ws: { Server: function () { return makeEmitter(); } },
+        http: {
+          createServer: function () {
+            var em = makeEmitter();
+            var srv = {
+              address: function () { return { port: 6463 }; },
+              listening: function () { return false; },
+              listen: function (_port, _host, cb) { if (typeof cb === "function") cb(); },
+              instanceId: 1,
+            };
+            for (var k in em) srv[k] = em[k];
+            return srv;
+          },
+        },
+      },
+    };
+    return discordRpcModule;
+  }
+
   // Wrap an explicitly-implemented object so that KNOWN members pass through as
   // written, but any UNKNOWN member access is logged and falls back to autoStub.
   // This is what makes the shim self-documenting during development.
@@ -266,6 +411,11 @@
 
   var nativeModulesShim = typed("nativeModules", {
     requireModule: function (name) {
+      // Rich Presence: return our transport facade so Discord runs its own RPC.
+      if (name === "discord_rpc") {
+        logOnce("nativeModules.requireModule(discord_rpc) -> transport facade");
+        return buildDiscordRpc();
+      }
       if (NULL_MODULES[name]) {
         logOnce("nativeModules.requireModule(" + name + ") -> null (fallback)");
         return null;
