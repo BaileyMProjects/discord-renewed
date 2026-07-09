@@ -1187,6 +1187,14 @@ function syncTitlebar() {
   const controls = document.createElement("div");
   Object.assign(controls.style, { marginLeft: "auto", display: "flex", alignItems: "center" });
 
+  // Customisation Mode toggle (paint palette).
+  const customise = titlebarButton(
+    '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.49 2 2 6.49 2 12s4.49 10 10 10c.93 0 1.5-.76 1.5-1.5 0-.4-.16-.76-.42-1.03-.24-.26-.42-.62-.42-1.02 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.96-4.49-9-10-9Zm-5 10a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm3-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm3 4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z"/></svg>',
+    "rgba(255,255,255,0.08)", 34
+  );
+  customise.title = "Customisation Mode (Ctrl+Shift+C)";
+  customise.addEventListener("click", () => toggleCustomiseMode());
+
   const inbox = titlebarButton(
     '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 12h-4c0 1.66-1.34 3-3 3s-3-1.34-3-3H5V5h14v10z"/></svg>',
     "rgba(255,255,255,0.08)", 34
@@ -1215,7 +1223,7 @@ function syncTitlebar() {
   min.addEventListener("click", () => winCtl("minimize"));
   max.addEventListener("click", () => winCtl("maximize"));
   close.addEventListener("click", () => winCtl("close"));
-  controls.append(inbox, help, divider, min, max, close);
+  controls.append(customise, inbox, help, divider, min, max, close);
 
   bar.append(navWrap, title, controls);
   document.documentElement.appendChild(bar);
@@ -1569,10 +1577,229 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.getElementById(PICKER_ID)) closeSourcePicker(null);
 });
 
+// ---------------------------------------------------------------------------
+// Customisation Mode — treat Discord's main sections as blocks you can restyle
+// (font / background colour / image) and (Phase 2) rearrange. An inline overlay
+// toggle (Ctrl+Shift+C, or the floating button) draws labelled boxes over each
+// live section; clicking one opens its style panel. Everything persists and is
+// applied via the normal CSS pipeline (customisationCss → buildCss).
+// ---------------------------------------------------------------------------
+
+// The rearrangeable/stylable blocks. `selectors` are tried in order (Discord's
+// DMs vs server views use different classes); first match wins. Found by live
+// DOM probe 2026-07-09 — classes are volatile, so match by substring not hash.
+const SECTIONS = [
+  { id: "serverList", label: "Server List", selectors: ['[class*="guilds_"]'] },
+  { id: "channelList", label: "Channel List", selectors: ['[class*="sidebarList"]'] },
+  { id: "chat", label: "Chat", selectors: ['[class*="chatContent_"]', '[class*="page_"]'] },
+  { id: "memberList", label: "Member List", selectors: ['[class*="membersWrap"]', '[class*="members_"]'] },
+];
+
+const SECTION_FONTS = [
+  { label: "Default", value: "" },
+  { label: "gg sans", value: "'gg sans', sans-serif" },
+  { label: "Arial", value: "Arial, sans-serif" },
+  { label: "Georgia", value: "Georgia, serif" },
+  { label: "Times New Roman", value: "'Times New Roman', serif" },
+  { label: "Courier New", value: "'Courier New', monospace" },
+  { label: "Comic Sans MS", value: "'Comic Sans MS', 'Comic Sans', cursive" },
+  { label: "Trebuchet MS", value: "'Trebuchet MS', sans-serif" },
+  { label: "Impact", value: "Impact, sans-serif" },
+];
+
+const CUSTOMISE_LAYER_ID = "dr-customise-layer";
+const SECTION_PANEL_ID = "dr-section-panel";
+let customiseModeOn = false;
+let customiseRaf = null;
+
+function findSectionEl(section) {
+  for (const sel of section.selectors) {
+    const el = document.querySelector(sel);
+    if (el) return el;
+  }
+  return null;
+}
+
+// Persisted per-section styles: { serverList: {font,bgColor,bgImage,dim}, ... }
+function allSectionStyles() {
+  return val("sectionStyles") || {};
+}
+function sectionStyle(id) {
+  return allSectionStyles()[id] || {};
+}
+function setSectionStyle(id, key, value) {
+  const all = { ...allSectionStyles() };
+  const one = { ...(all[id] || {}) };
+  if (value === "" || value == null) delete one[key];
+  else one[key] = value;
+  all[id] = one;
+  setSetting("sectionStyles", all); // persists + re-applies via applyStyles → buildCss
+}
+
+// Emit per-section CSS. Placed LAST in buildCss so it wins over the wallpaper's
+// panel-transparency rules when the user sets a section colour/image.
+// Inner containers that carry Discord's own opaque fills — cleared (scoped to a
+// section) so a section's chosen colour/image shows through. Kept modest to avoid
+// wiping content surfaces (avatars, badges) like the wallpaper feature learned.
+const SECTION_BG_CLEAR = ['[class*="scroller_"]', '[class*="scrollerContent_"]', '[class*="scrollableContainer"]', '[class*="content_"]', '[class*="chatContent_"]', '[class*="chat_"]', '[class*="messagesWrapper_"]', '[class*="base_"]', '[class*="privateChannels_"]', '[class*="container_"]', '[class*="members_"]'];
+
+function customisationCss() {
+  const all = allSectionStyles();
+  let css = "";
+  for (const s of SECTIONS) {
+    const st = all[s.id];
+    if (!st) continue;
+    const sel = s.selectors.join(", ");
+
+    // Font: apply to the section AND every descendant — Discord sets explicit
+    // font-family on text nodes, so plain inheritance won't take.
+    if (st.font) {
+      const fontSel = s.selectors.map((x) => `${x}, ${x} *`).join(", ");
+      css += `${fontSel} { font-family: ${st.font} !important; }\n`;
+    }
+
+    // Background colour / image: paint the section base, then clear the inner
+    // opaque panel fills within it so the paint is visible.
+    if (st.bgColor || st.bgImage) {
+      let paint = "";
+      if (st.bgColor) paint += `background-color: ${st.bgColor} !important;`;
+      if (st.bgImage) {
+        const dim = clamp(Number(st.dim) || 0, 0, 100) / 100;
+        const dimC = `rgba(0,0,0,${dim})`;
+        paint += `background-image: linear-gradient(${dimC}, ${dimC}), url("${st.bgImage}") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important;`;
+      }
+      css += `${sel} { ${paint} }\n`;
+      const clearSel = s.selectors.flatMap((x) => SECTION_BG_CLEAR.map((c) => `${x} ${c}`)).join(", ");
+      css += `${clearSel} { background-color: transparent !important; background-image: none !important; }\n`;
+    }
+  }
+  return css;
+}
+
+function toggleCustomiseMode() {
+  if (customiseModeOn) exitCustomiseMode();
+  else enterCustomiseMode();
+}
+
+function enterCustomiseMode() {
+  if (customiseModeOn) return;
+  customiseModeOn = true;
+
+  const layer = document.createElement("div");
+  layer.id = CUSTOMISE_LAYER_ID;
+  Object.assign(layer.style, { position: "fixed", inset: "0", zIndex: "180000", pointerEvents: "none", fontFamily: "var(--font-primary, sans-serif)" });
+  document.documentElement.appendChild(layer);
+
+  // Top banner: mode indicator + hint + exit.
+  const banner = document.createElement("div");
+  Object.assign(banner.style, { position: "fixed", top: `${TITLEBAR_H + 8}px`, left: "50%", transform: "translateX(-50%)", zIndex: "180001", background: "#5865f2", color: "#fff", padding: "8px 14px", borderRadius: "8px", boxShadow: "0 4px 16px rgba(0,0,0,0.4)", display: "flex", alignItems: "center", gap: "12px", pointerEvents: "auto", fontSize: "14px", fontWeight: "600" });
+  const bannerText = document.createElement("span");
+  bannerText.textContent = "🎨 Customisation Mode — click a section to style it";
+  const exitBtn = document.createElement("button");
+  exitBtn.textContent = "Done";
+  Object.assign(exitBtn.style, { background: "#fff", color: "#5865f2", border: "none", borderRadius: "6px", padding: "4px 12px", fontWeight: "700", cursor: "pointer" });
+  exitBtn.addEventListener("click", exitCustomiseMode);
+  banner.append(bannerText, exitBtn);
+  layer.appendChild(banner);
+
+  // One labelled box per section, repositioned to track the live rects.
+  const boxes = {};
+  for (const s of SECTIONS) {
+    const box = document.createElement("div");
+    Object.assign(box.style, { position: "fixed", boxSizing: "border-box", border: "2px dashed rgba(88,101,242,0.9)", background: "rgba(88,101,242,0.08)", borderRadius: "6px", cursor: "pointer", pointerEvents: "auto", display: "none", transition: "background 0.1s" });
+    box.addEventListener("mouseenter", () => (box.style.background = "rgba(88,101,242,0.18)"));
+    box.addEventListener("mouseleave", () => (box.style.background = "rgba(88,101,242,0.08)"));
+    const label = document.createElement("div");
+    label.textContent = s.label;
+    Object.assign(label.style, { position: "absolute", top: "8px", left: "8px", background: "#5865f2", color: "#fff", padding: "3px 10px", borderRadius: "6px", fontSize: "13px", fontWeight: "700", pointerEvents: "none", boxShadow: "0 2px 8px rgba(0,0,0,0.4)" });
+    box.appendChild(label);
+    box.addEventListener("click", (e) => { e.stopPropagation(); openSectionStylePanel(s); });
+    layer.appendChild(box);
+    boxes[s.id] = box;
+  }
+
+  const reposition = () => {
+    if (!customiseModeOn) return;
+    for (const s of SECTIONS) {
+      const el = findSectionEl(s);
+      const box = boxes[s.id];
+      if (el) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          Object.assign(box.style, { display: "block", left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+        } else box.style.display = "none";
+      } else box.style.display = "none";
+    }
+    customiseRaf = requestAnimationFrame(reposition);
+  };
+  reposition();
+}
+
+function exitCustomiseMode() {
+  customiseModeOn = false;
+  if (customiseRaf) cancelAnimationFrame(customiseRaf);
+  customiseRaf = null;
+  document.getElementById(CUSTOMISE_LAYER_ID)?.remove();
+  document.getElementById(SECTION_PANEL_ID)?.remove();
+}
+
+// The per-section style editor (font / background colour / background image).
+function openSectionStylePanel(section) {
+  document.getElementById(SECTION_PANEL_ID)?.remove();
+  const panel = document.createElement("div");
+  panel.id = SECTION_PANEL_ID;
+  Object.assign(panel.style, { position: "fixed", zIndex: "200500", top: `${TITLEBAR_H + 56}px`, right: "24px", width: "268px", background: "#232428", borderRadius: "10px", boxShadow: "0 12px 40px rgba(0,0,0,0.6)", color: "#f2f3f5", fontFamily: "var(--font-primary, sans-serif)", padding: "18px", pointerEvents: "auto" });
+
+  const header = document.createElement("div");
+  Object.assign(header.style, { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "14px" });
+  const title = document.createElement("div");
+  title.textContent = section.label;
+  Object.assign(title.style, { fontSize: "17px", fontWeight: "700" });
+  const close = document.createElement("button");
+  close.textContent = "✕";
+  Object.assign(close.style, { background: "transparent", border: "none", color: "#b5bac1", fontSize: "16px", cursor: "pointer" });
+  close.addEventListener("click", () => panel.remove());
+  header.append(title, close);
+  panel.appendChild(header);
+
+  const fieldLabel = (text) => { const d = document.createElement("div"); d.textContent = text; Object.assign(d.style, { fontSize: "12px", fontWeight: "700", color: "#b5bac1", textTransform: "uppercase", margin: "12px 0 6px" }); return d; };
+
+  // Font
+  panel.appendChild(fieldLabel("Font"));
+  const fontSel = document.createElement("select");
+  Object.assign(fontSel.style, { width: "100%", padding: "8px", borderRadius: "6px", background: "#1e1f22", color: "#f2f3f5", border: "1px solid rgba(255,255,255,0.1)", cursor: "pointer" });
+  for (const f of SECTION_FONTS) { const o = document.createElement("option"); o.value = f.value; o.textContent = f.label; if ((sectionStyle(section.id).font || "") === f.value) o.selected = true; fontSel.appendChild(o); }
+  fontSel.addEventListener("change", () => setSectionStyle(section.id, "font", fontSel.value));
+  panel.appendChild(fontSel);
+
+  // Background colour
+  panel.appendChild(fieldLabel("Background colour"));
+  const colorRow = document.createElement("div");
+  Object.assign(colorRow.style, { display: "flex", alignItems: "center", gap: "10px" });
+  const colorInput = document.createElement("input");
+  colorInput.type = "color";
+  colorInput.value = sectionStyle(section.id).bgColor || "#313338";
+  Object.assign(colorInput.style, { width: "48px", height: "34px", border: "none", background: "transparent", cursor: "pointer" });
+  colorInput.addEventListener("input", () => setSectionStyle(section.id, "bgColor", colorInput.value));
+  const colorClear = document.createElement("button");
+  colorClear.textContent = "Clear";
+  Object.assign(colorClear.style, { background: "#4e5058", color: "#fff", border: "none", borderRadius: "6px", padding: "6px 12px", cursor: "pointer" });
+  colorClear.addEventListener("click", () => setSectionStyle(section.id, "bgColor", ""));
+  colorRow.append(colorInput, colorClear);
+  panel.appendChild(colorRow);
+
+  document.documentElement.appendChild(panel);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && e.shiftKey && (e.key === "C" || e.key === "c")) { e.preventDefault(); toggleCustomiseMode(); }
+});
+
 // Combine every section's CSS. Future sections (theme, fonts, custom CSS) get
 // appended here.
 function buildCss() {
-  return backgroundCss() + titlebarCss();
+  // customisationCss last so per-section colours/images win over the wallpaper.
+  return backgroundCss() + titlebarCss() + customisationCss();
 }
 
 function applyStyles() {
