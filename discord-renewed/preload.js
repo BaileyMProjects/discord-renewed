@@ -406,7 +406,7 @@ const SCHEMA = [
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
   { section: "System", id: "perfMode", type: "select", label: "Performance mode (applies after restart). Measured RAM vs Discord's ~590 MB — Smooth: full GPU, ~490 MB (~17% lighter), buttery. Optimised: GPU off, ~380 MB (~36% lighter) but video/screen-share/animation get clunkier.", choices: ["Smooth", "Optimised"], def: "Smooth" },
   { section: "System", id: "minimizeToTray", type: "toggle", label: "Keep running in the system tray when closed (like the real Discord app), instead of quitting", def: true },
-  { section: "System", id: "launchOnStartup", type: "toggle", label: "Launch Discord Renewed automatically when Windows starts", def: false },
+  { section: "System", id: "launchOnStartup", type: "toggle", label: "Launch Discord Renewed automatically when Windows starts (and stop the official Discord from auto-starting, so you don't get both)", def: false },
   { section: "System", id: "startMinimized", type: "toggle", label: "Start hidden in the system tray (no window) — pair with launch on startup for a silent boot", def: false },
   { section: "Spotify", id: "spotify", type: "spotify", label: "Spotify" },
   { section: "Spotify", id: "dockedPlayer", type: "toggle", label: "Show a Spotify mini-player docked above your profile (pop it out with ⤢ to drag it anywhere)", def: false },

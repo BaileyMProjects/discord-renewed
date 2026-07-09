@@ -300,7 +300,83 @@ function applyLoginItemSettings(s) {
   }
 }
 
-ipcMain.on("dr:apply-login-settings", () => applyLoginItemSettings(readSettings()));
+// Keep the official Discord from ALSO auto-starting when our client is set to.
+// We back its startup registration up into our settings first, so turning our
+// auto-start off restores Discord's exactly. Reads are safe; the only value that
+// ever goes on a command line (restore) is base64-encoded to dodge quote issues
+// with Discord's quoted Update.exe command string.
+const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const DISCORD_RUN_NAMES = ["Discord", "DiscordCanary", "DiscordPTB", "DiscordDevelopment"];
+
+function regQuery(name) {
+  return new Promise((resolve) => {
+    execFile("reg", ["query", RUN_KEY, "/v", name], { windowsHide: true }, (err, stdout) => {
+      if (err || !stdout) return resolve(null);
+      const line = stdout.split(/\r?\n/).find((l) => l.includes("REG_SZ"));
+      resolve(line ? line.slice(line.indexOf("REG_SZ") + 6).trim() : null);
+    });
+  });
+}
+function regDelete(name) {
+  return new Promise((resolve) =>
+    execFile("reg", ["delete", RUN_KEY, "/v", name, "/f"], { windowsHide: true }, () => resolve()));
+}
+function regAddSafe(name, value) {
+  // Pass the value base64-encoded through PowerShell so embedded quotes/spaces in
+  // Discord's command string can't be mangled by command-line parsing.
+  const b64 = Buffer.from(value, "utf8").toString("base64");
+  const ps = `$v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'));` +
+    `Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '${name}' -Value $v`;
+  return new Promise((resolve) =>
+    execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true }, () => resolve()));
+}
+
+async function disableDiscordAutostart() {
+  const s = readSettings();
+  const backup = s.discordAutostartBackup || {};
+  for (const name of DISCORD_RUN_NAMES) {
+    const val = await regQuery(name);
+    if (val != null) {
+      backup[name] = val; // remember the original so we can restore it later
+      await regDelete(name);
+      console.log("[DiscordRenewed] disabled Discord autostart:", name);
+    }
+  }
+  s.discordAutostartBackup = backup;
+  writeSettings(s);
+}
+
+async function restoreDiscordAutostart() {
+  const s = readSettings();
+  const backup = s.discordAutostartBackup;
+  if (!backup) return; // we never disabled anything → leave Discord alone
+  for (const name of Object.keys(backup)) {
+    if ((await regQuery(name)) == null) { // don't clobber a value Discord re-added
+      await regAddSafe(name, backup[name]);
+      console.log("[DiscordRenewed] restored Discord autostart:", name);
+    }
+  }
+  delete s.discordAutostartBackup;
+  writeSettings(s);
+}
+
+// Discord's autostart should be OFF exactly while ours is ON. Enforced on boot and
+// whenever the toggle changes. Only ever touches Discord's entry if WE disabled it.
+async function syncDiscordAutostart(s) {
+  if (process.platform !== "win32") return;
+  try {
+    if (s.launchOnStartup) await disableDiscordAutostart();
+    else await restoreDiscordAutostart();
+  } catch (err) {
+    console.log("[DiscordRenewed] syncDiscordAutostart error:", err && err.message);
+  }
+}
+
+ipcMain.on("dr:apply-login-settings", () => {
+  const s = readSettings();
+  applyLoginItemSettings(s);
+  syncDiscordAutostart(s);
+});
 
 // Open the native file picker, COPY the chosen image or video into the app data
 // folder, record it, and return it as a { type, url } resource the page can use
@@ -854,6 +930,7 @@ if (!gotLock) {
     setupScreenShareHandler();
     const bootSettings = readSettings();
     applyLoginItemSettings(bootSettings); // keep the OS startup registration in sync
+    syncDiscordAutostart(bootSettings); // keep official Discord suppressed while ours autostarts
     const startHidden = Boolean(bootSettings.startMinimized) || process.argv.includes("--start-minimized");
     const win = createWindow(startHidden);
     setupTray(win);
