@@ -9,6 +9,142 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
+// Image right-click actions. Discord's WEB app (unlike the native desktop
+// client) never adds "Copy Image"/"Save Image" to its context menu — it leaves
+// image actions to the browser, which Electron doesn't supply. So we add those
+// items INTO Discord's own context menu, cloned from a real menu item so they
+// look 100% native, and wire them to Electron capabilities in main.js. We do NOT
+// replace or intercept Discord's menu — we let it render, then inject.
+//
+// UI images that have their OWN Discord right-click menu (or none) — we must
+// NOT hijack these: avatars (user menu), custom emoji, reactions, stickers, and
+// guild/server icons (server menu). Only real posted/embedded content images
+// should get our native menu. Matched against the class names of the image and
+// a few ancestors; guild icons are matched by their data-list-item-id instead.
+const UI_IMAGE_SKIP = /avatar|emoji|reaction|sticker|guildIcon|roleIcon|banner|status/i;
+function isUiImage(el) {
+  for (let a = el, i = 0; a && i < 6; a = a.parentElement, i++) {
+    const cls = typeof a.className === "string" ? a.className : "";
+    if (UI_IMAGE_SKIP.test(cls)) return true;
+    const lid = a.getAttribute && a.getAttribute("data-list-item-id");
+    if (lid && lid.indexOf("guildsnav") === 0) return true;
+  }
+  return false;
+}
+function imageUrlAtPoint(x, y) {
+  let els;
+  try { els = document.elementsFromPoint(x, y); } catch { return ""; }
+  for (const el of els) {
+    let src = "";
+    if (el.tagName === "IMG") {
+      src = el.currentSrc || el.src;
+    } else {
+      const bg = el.style && el.style.backgroundImage;
+      if (bg && bg.indexOf("url(") !== -1) {
+        const m = bg.match(/url\(["']?(.*?)["']?\)/);
+        if (m) src = m[1];
+      }
+    }
+    if (!src || !/^(https?:|blob:|data:)/.test(src)) continue;
+    if (isUiImage(el)) return ""; // avatar/emoji/server icon → let Discord handle it
+    return src;
+  }
+  return "";
+}
+// Icons (24×24 path data, drawn in Discord's currentColor) for our injected items.
+const DR_IMG_ICONS = {
+  copy: "M3 5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1a1 1 0 1 1-2 0V5H5v9h1a1 1 0 1 1 0 2H5a2 2 0 0 1-2-2V5Z M8 10a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9Zm2 0v9h9v-9h-9Z",
+  save: "M12 3a1 1 0 0 1 1 1v9.59l2.3-2.3a1 1 0 0 1 1.4 1.42l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.42l2.3 2.3V4a1 1 0 0 1 1-1ZM5 19a1 1 0 0 1 1-1h12a1 1 0 0 1 0 2H6a1 1 0 0 1-1-1Z",
+  link: "M16.32 14.72a1 1 0 0 1 0-1.41l2.51-2.51a3.98 3.98 0 0 0-5.62-5.63l-2.52 2.51a1 1 0 0 1-1.41-1.41l2.52-2.52a5.98 5.98 0 0 1 8.45 8.46l-2.52 2.51a1 1 0 0 1-1.41 0ZM7.68 9.29a1 1 0 0 1 0 1.41l-2.52 2.51a3.98 3.98 0 1 0 5.63 5.63l2.51-2.52a1 1 0 0 1 1.42 1.42l-2.52 2.51a5.98 5.98 0 0 1-8.45-8.45l2.51-2.51a1 1 0 0 1 1.42 0Z M14.7 10.7a1 1 0 0 0-1.4-1.4l-4 4a1 1 0 1 0 1.4 1.4l4-4Z",
+  open: "M14 4a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v5a1 1 0 0 1-2 0V6.41l-7.3 7.3a1 1 0 0 1-1.4-1.42L17.59 5H15a1 1 0 0 1-1-1ZM5 7a2 2 0 0 1 2-2h4a1 1 0 0 1 0 2H7v10h10v-4a1 1 0 0 1 2 0v4a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V7Z",
+};
+
+// Record the image (if any) under the cursor on every right-click, so the menu
+// observer below knows whether to inject image items — and for which URL.
+let drLastImage = null;
+window.addEventListener("contextmenu", (e) => {
+  const srcURL = imageUrlAtPoint(e.clientX, e.clientY);
+  drLastImage = srcURL ? { srcURL, x: e.clientX, y: e.clientY } : null;
+}, true);
+
+// Build one injected menu item by cloning a real Discord item (so classes/layout
+// match the current build), then relabelling + reskinning it.
+function drBuildMenuItem(template, id, label, iconPath, onClick) {
+  const item = template.cloneNode(true);
+  item.id = id;
+  item.setAttribute("data-dr-item", "1");
+  item.removeAttribute("aria-describedby");
+  item.setAttribute("aria-label", label);
+  const labelEl = item.querySelector('[class*="label_"]') || item.firstElementChild;
+  if (labelEl) labelEl.textContent = label;
+  const svg = item.querySelector("svg");
+  if (svg) svg.innerHTML = '<path fill="currentColor" d="' + iconPath + '"></path>';
+  // Discord highlights the focused row via a `focused_<hash>` class from the same
+  // CSS module as the item classes — derive that hash so hover matches natively.
+  const hashMatch = (template.className.match(/\bitem_(\w+)/) || [])[1];
+  const focusedClass = hashMatch ? "focused_" + hashMatch : null;
+  if (focusedClass) {
+    item.addEventListener("mouseenter", () => item.classList.add(focusedClass));
+    item.addEventListener("mouseleave", () => item.classList.remove(focusedClass));
+  }
+  item.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    try { onClick(); } catch {}
+    // Close Discord's menu the way it closes itself — Escape dismisses the layer.
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true }));
+  });
+  return item;
+}
+
+// Inject "Copy Image / Save Image / Copy Image Link / Open Image in Browser" into
+// a freshly-opened Discord message context menu when the right-click was on a
+// content image.
+function drInjectImageItems(menu) {
+  if (!drLastImage || menu.getAttribute("data-dr-image-items")) return;
+  // Only the message menu (image right-clicks land here); avatars/servers/etc.
+  // open different menus with different item ids, which we leave untouched.
+  const template = menu.querySelector('#message-copy-link') || menu.querySelector('[role="menuitem"][id^="message-"]');
+  if (!template || template.id.indexOf("message-") !== 0) return;
+  menu.setAttribute("data-dr-image-items", "1");
+
+  const { srcURL, x, y } = drLastImage;
+  const isHttp = /^https?:/.test(srcURL);
+  const send = (action) => ipcRenderer.send("dr:image-action", { action, srcURL, x, y });
+  const specs = [
+    { id: "dr-copy-image", label: "Copy Image", icon: DR_IMG_ICONS.copy, on: () => send("copy") },
+    { id: "dr-save-image", label: "Save Image As…", icon: DR_IMG_ICONS.save, on: () => send("save") },
+  ];
+  if (isHttp) {
+    specs.push({ id: "dr-copy-image-link", label: "Copy Image Link", icon: DR_IMG_ICONS.link, on: () => send("copy-link") });
+    specs.push({ id: "dr-open-image", label: "Open Image in Browser", icon: DR_IMG_ICONS.open, on: () => send("open") });
+  }
+  const nodes = specs.map((s) => drBuildMenuItem(template, s.id, s.label, s.icon, s.on));
+
+  // Place them at the very bottom, under "Delete Message" — inserting near
+  // "Add Reaction" lands them in the horizontal quick-react row's flex group,
+  // which breaks their layout. The bottom group is a normal vertical list.
+  const allItems = [...menu.querySelectorAll('[role="menuitem"][id^="message-"]')];
+  const anchor = menu.querySelector('#message-delete') || allItems[allItems.length - 1] || template;
+  let after = anchor;
+  for (const n of nodes) { after.parentNode.insertBefore(n, after.nextSibling); after = n; }
+}
+
+// Context menus render into a portal appended late in the DOM, so watch the whole
+// body subtree for a menu appearing and inject once. The check is cheap (a match
+// + one scoped query per added node).
+new MutationObserver((records) => {
+  if (!drLastImage) return;
+  for (const rec of records) {
+    for (const node of rec.addedNodes) {
+      if (node.nodeType !== 1) continue;
+      const menu = node.matches && node.matches('[role="menu"]') ? node
+        : (node.querySelector ? node.querySelector('[role="menu"]') : null);
+      if (menu) { try { drInjectImageItems(menu); } catch {} }
+    }
+  }
+}).observe(document, { childList: true, subtree: true });
+
 // Inject a MAIN-WORLD script into Discord's page context. Our preload lives in an
 // isolated world and can't see (or define globals on) Discord's own window, so
 // these have to run as page <script>s. We do it at the very top of preload

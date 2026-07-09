@@ -3,7 +3,7 @@
 // application window and load Discord into it. Later we'll use this same
 // process to wire up our custom settings.
 
-const { app, BrowserWindow, ipcMain, dialog, session, protocol, net, shell, screen, desktopCapturer, Tray, Menu, nativeImage } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, session, protocol, net, shell, screen, desktopCapturer, Tray, Menu, nativeImage, clipboard } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
@@ -98,6 +98,52 @@ function createWindow() {
     console.log("[DiscordRenewed] RENDERER GONE:", JSON.stringify(details));
   });
   win.webContents.on("unresponsive", () => console.log("[DiscordRenewed] renderer unresponsive"));
+
+  // --- Web-mode desktop integration --------------------------------------
+  // We load Discord's WEB app, so a few things a real browser tab (or the native
+  // desktop client) would handle need wiring up here, or image/link actions in
+  // Discord's right-click menu silently do nothing.
+
+  // "Open Link" / "Open Original" / any external link → open in the user's real
+  // browser instead of a blank in-app popup. Discord's own popout windows
+  // (voice/stream popouts on discord.com) are allowed to open in-app.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const u = new URL(url);
+      if (/(^|\.)discord\.com$/i.test(u.hostname) && u.pathname.startsWith("/popout")) {
+        return { action: "allow" };
+      }
+    } catch {}
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
+
+  // Grant the browser permissions Discord's web app needs to behave like the
+  // desktop client — notably clipboard write (so "Copy Image" works) and media
+  // (mic/camera/screenshare). Electron denies several of these by default.
+  const GRANTED_PERMISSIONS = new Set([
+    "media", "mediaKeySystem", "clipboard-read", "clipboard-sanitized-write",
+    "display-capture", "notifications", "fullscreen", "pointerLock", "idle-detection",
+  ]);
+  win.webContents.session.setPermissionRequestHandler((_wc, permission, callback) => {
+    const ok = GRANTED_PERMISSIONS.has(permission);
+    if (!ok) console.log("[DiscordRenewed] permission DENIED:", permission);
+    callback(ok);
+  });
+  // Some Chromium checks use the synchronous check handler instead.
+  win.webContents.session.setPermissionCheckHandler((_wc, permission) => GRANTED_PERMISSIONS.has(permission));
+
+  // "Save Image" / attachment downloads: let Electron prompt with a Save dialog
+  // (default when no savePath is set). Logged so we can confirm it fires.
+  win.webContents.session.on("will-download", (_event, item) => {
+    console.log("[DiscordRenewed] will-download:", item.getFilename());
+  });
+
+  // Image actions in the right-click menu. Discord's WEB app never adds
+  // Copy/Save/Open-image to its context menu (the native desktop client does),
+  // so the preload injects those items into Discord's own menu and they call
+  // back here to run with real Electron capabilities (see ipcMain
+  // "dr:image-action": clipboard image write, download, external open).
 
   // Load the real Discord web app, using our Chrome-like user agent.
   win.loadURL("https://discord.com/app", { userAgent: CHROME_USER_AGENT });
@@ -418,6 +464,69 @@ ipcMain.on("dr:win-forward", (e) => {
 });
 ipcMain.on("dr:open-external", (_e, url) => {
   if (typeof url === "string" && url.startsWith("https://")) shell.openExternal(url);
+});
+
+// Fetch a URL and decode it into a nativeImage (from the main process, so no CORS
+// limits). Returns null on failure. Logs content-type so we can see webp cases.
+async function fetchAsImage(url) {
+  try {
+    const res = await net.fetch(url);
+    const img = nativeImage.createFromBuffer(Buffer.from(await res.arrayBuffer()));
+    // Discord serves webp by default, which nativeImage can't decode → empty;
+    // the caller retries with format=png. Only log the miss, not every copy.
+    if (img.isEmpty()) console.log("[DiscordRenewed] copy: undecodable", res.headers.get("content-type"), url.slice(0, 80));
+    return img;
+  } catch (err) {
+    console.log("[DiscordRenewed] copy fetch error:", err && err.message);
+    return null;
+  }
+}
+
+// Rewrite a Discord CDN image URL to force a decodable format (e.g. png).
+function forceImageFormat(url, format) {
+  try {
+    const u = new URL(url);
+    u.searchParams.set("format", format);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+// Run an image action chosen from the items we inject into Discord's OWN context
+// menu (preload). Discord's web app never wires these up, so we do it here with
+// real Electron capabilities: clipboard image write, download, external open.
+ipcMain.on("dr:image-action", async (e, data) => {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  if (!win || !data || typeof data.srcURL !== "string") return;
+  const wc = win.webContents;
+  const { action, srcURL, x, y } = data;
+  try {
+    if (action === "copy") {
+      // Fetch the bytes and put a real image on the clipboard. Discord serves
+      // most images as webp, which nativeImage can't decode — so if the first
+      // fetch yields an empty image, refetch forcing PNG from Discord's CDN.
+      // Fall back to copyImageAt (hit-tests the page) for blob:/data: or failures.
+      let img = null;
+      if (/^https?:/.test(srcURL)) {
+        img = await fetchAsImage(srcURL);
+        if ((!img || img.isEmpty()) && /discordapp\.(net|com)/.test(srcURL)) {
+          img = await fetchAsImage(forceImageFormat(srcURL, "png"));
+        }
+      }
+      if (img && !img.isEmpty()) clipboard.writeImage(img);
+      else wc.copyImageAt(Math.round(x), Math.round(y));
+    } else if (action === "save") {
+      wc.downloadURL(srcURL);
+    } else if (action === "copy-link") {
+      clipboard.writeText(srcURL);
+    } else if (action === "open") {
+      shell.openExternal(srcURL);
+    }
+  } catch (err) {
+    console.log("[DiscordRenewed] image-action error:", action, err && err.message);
+    if (action === "copy") { try { wc.copyImageAt(Math.round(x), Math.round(y)); } catch {} }
+  }
 });
 
 // Window controls driven by Discord's OWN desktop title bar under the spoof
