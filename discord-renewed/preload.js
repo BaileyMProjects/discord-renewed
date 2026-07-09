@@ -633,6 +633,8 @@ const DOCK_ID = "dr-docked-player"; // floating (popped-out) card
 const DOCK_INLINE_ID = "dr-dock-inline"; // docked into the sidebar above the profile
 const DOCK_RESERVE_ID = "dr-dock-reserve"; // <style> that pushes sidebar content below the docked player
 let dockInterval = null;
+let dockTicker = null; // ticks the progress bar/elapsed forward locally every ~0.5s between polls
+let dockAnchor = null; // { progressMs, durationMs, playing, ts } — last synced position + when we got it
 let dockBusy = false;
 let dockScrubbing = false; // true while dragging the progress bar to seek
 let dockInlineReserve = 0; // px of sidebar top space currently reserved for the docked player
@@ -944,6 +946,7 @@ function updateDock(dock, data) {
   const inline = dock.id === DOCK_INLINE_ID;
   if (!data || !data.connected || !data.track) {
     dock.style.display = "none";
+    dockAnchor = null;
     if (inline) updateInlineReserve();
     return;
   }
@@ -958,13 +961,16 @@ function updateDock(dock, data) {
   r.artist.textContent = data.artists || "";
   dock._durationMs = data.durationMs || 0;
   r.duration.textContent = msToClock(data.durationMs);
+  const playing = Boolean(data.playing);
+  // Anchor the local ticker to this fresh position so it can advance the bar/time
+  // every ~0.5s between the 3s polls (Spotify's own time only arrives each poll).
+  dockAnchor = { progressMs: data.progressMs || 0, durationMs: data.durationMs || 0, playing, ts: Date.now() };
   // Don't overwrite the bar/elapsed while the user is dragging it to seek.
   if (!dockScrubbing) {
     const pct = data.durationMs ? Math.min(100, (data.progressMs / data.durationMs) * 100) : 0;
     r.barFill.style.width = `${pct}%`;
     r.elapsed.textContent = msToClock(data.progressMs);
   }
-  const playing = Boolean(data.playing);
   r.play.dataset.playing = playing ? "1" : "0";
   r.play.innerHTML = playing ? ICONS.pause : ICONS.play;
 
@@ -986,6 +992,20 @@ function pollDock() {
     .invoke("dr:spotify-now-playing")
     .then((data) => updateDock(dock, data))
     .finally(() => (dockBusy = false));
+}
+
+// Advance the progress bar + elapsed time locally between polls, so a playing
+// track ticks smoothly every half-second instead of jumping every 3s poll. Pure
+// local rendering — no extra Spotify API calls. Skips while paused or scrubbing.
+function tickDock() {
+  if (!dockAnchor || !dockAnchor.playing || dockScrubbing) return;
+  const dock = currentDock();
+  if (!dock || dock.style.display === "none") return;
+  const r = dock._refs;
+  const dur = dockAnchor.durationMs;
+  const elapsedMs = Math.min(dur || Infinity, dockAnchor.progressMs + (Date.now() - dockAnchor.ts));
+  r.elapsed.textContent = msToClock(elapsedMs);
+  r.barFill.style.width = `${dur ? Math.min(100, (elapsedMs / dur) * 100) : 0}%`;
 }
 
 // Add the docked (inline) mini-player. It's a FIXED overlay pinned above the
@@ -1054,6 +1074,11 @@ function syncDockedPlayer() {
       clearInterval(dockInterval);
       dockInterval = null;
     }
+    if (dockTicker) {
+      clearInterval(dockTicker);
+      dockTicker = null;
+    }
+    dockAnchor = null;
     return;
   }
 
@@ -1069,6 +1094,7 @@ function syncDockedPlayer() {
   }
 
   if (!dockInterval) dockInterval = setInterval(pollDock, 3000);
+  if (!dockTicker) dockTicker = setInterval(tickDock, 500);
   pollDock();
 }
 
