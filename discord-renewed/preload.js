@@ -145,6 +145,45 @@ new MutationObserver((records) => {
   }
 }).observe(document, { childList: true, subtree: true });
 
+// Taskbar unread badge + flash. Discord keeps its unread/mention count in the
+// window title as a leading "(N)". We read it, draw a small red numbered badge on
+// a canvas, and hand it to main to show as a Windows taskbar OVERLAY icon (and to
+// flash the taskbar on a new ping). Drawing here (not in main) is because
+// nativeImage can't rasterise text; main just decodes the PNG we produce.
+let drLastUnread = -1;
+function drDrawBadge(count) {
+  const size = 32;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#f23f42"; // Discord's mention red
+  ctx.beginPath();
+  ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+  ctx.fill();
+  // Match the real desktop client: the tiny taskbar overlay caps at "9+".
+  const text = count > 9 ? "9+" : String(count);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = `bold ${text.length === 2 ? 18 : 22}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, size / 2, size / 2 + 1);
+  return canvas.toDataURL("image/png");
+}
+function drUpdateUnread() {
+  const count = parseInt((document.title.match(/^\((\d+)\)/) || [])[1] || "0", 10) || 0;
+  if (count === drLastUnread) return; // only tell main on an actual change
+  drLastUnread = count;
+  ipcRenderer.send("dr:set-unread", { count, badge: count > 0 ? drDrawBadge(count) : null });
+}
+function drSetupUnreadBadge() {
+  const titleEl = document.querySelector("title");
+  if (!titleEl) { setTimeout(drSetupUnreadBadge, 500); return; } // <title> not in the DOM yet
+  drUpdateUnread();
+  new MutationObserver(drUpdateUnread).observe(titleEl, { childList: true, characterData: true, subtree: true });
+}
+drSetupUnreadBadge();
+
 // Inject a MAIN-WORLD script into Discord's page context. Our preload lives in an
 // isolated world and can't see (or define globals on) Discord's own window, so
 // these have to run as page <script>s. We do it at the very top of preload
@@ -367,6 +406,8 @@ const SCHEMA = [
   { section: "System", id: "clearCache", type: "button", label: "Free up memory now", action: "clear-cache" },
   { section: "System", id: "perfMode", type: "select", label: "Performance mode (applies after restart). Measured RAM vs Discord's ~590 MB — Smooth: full GPU, ~490 MB (~17% lighter), buttery. Optimised: GPU off, ~380 MB (~36% lighter) but video/screen-share/animation get clunkier.", choices: ["Smooth", "Optimised"], def: "Smooth" },
   { section: "System", id: "minimizeToTray", type: "toggle", label: "Keep running in the system tray when closed (like the real Discord app), instead of quitting", def: true },
+  { section: "System", id: "launchOnStartup", type: "toggle", label: "Launch Discord Renewed automatically when Windows starts", def: false },
+  { section: "System", id: "startMinimized", type: "toggle", label: "Start hidden in the system tray (no window) — pair with launch on startup for a silent boot", def: false },
   { section: "Spotify", id: "spotify", type: "spotify", label: "Spotify" },
   { section: "Spotify", id: "dockedPlayer", type: "toggle", label: "Show a Spotify mini-player docked above your profile (pop it out with ⤢ to drag it anywhere)", def: false },
   { section: "Spotify", id: "tabColor", type: "color", label: "Mini-player background colour", def: "", defColor: "#1e1f22" },
@@ -460,6 +501,8 @@ function setSetting(id, value) {
   ipcRenderer.invoke("dr:set-setting", id, value);
   applyStyles();
   sendStreamConfig(); // cheap no-op unless a "stream*" setting changed
+  // These need main to re-apply the OS auto-launch registration on change.
+  if (id === "launchOnStartup" || id === "startMinimized") ipcRenderer.send("dr:apply-login-settings");
 }
 
 // ---------------------------------------------------------------------------

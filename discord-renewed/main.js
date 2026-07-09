@@ -39,12 +39,15 @@ const CHROME_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-function createWindow() {
+function createWindow(startHidden) {
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
     title: "Discord Renewed",
     icon: ICON_PATH,
+    // Start hidden in the tray when the user asked to (startMinimized / launched
+    // at login with --start-minimized). The tray brings it up on demand.
+    show: !startHidden,
     // Frameless: drop the OS title bar + window buttons. We draw our own
     // Discord-style title bar in the page (see syncTitlebar in preload.js) so the
     // window doesn't look like a browser tab. Still resizable from the edges.
@@ -279,6 +282,25 @@ ipcMain.handle("dr:set-setting", (_event, key, value) => {
   s[key] = value;
   writeSettings(s);
 });
+
+// Register/deregister the app with Windows startup, per the launchOnStartup /
+// startMinimized settings. `openAsHidden` is macOS-only, so on Windows we pass a
+// --start-minimized arg instead and honour it in createWindow. NB: in dev
+// (electron .) process.execPath is the Electron binary, so real auto-launch only
+// works once the app is packaged; the wiring + start-minimized are testable now.
+function applyLoginItemSettings(s) {
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: Boolean(s.launchOnStartup),
+      path: process.execPath,
+      args: s.startMinimized ? ["--start-minimized"] : [],
+    });
+  } catch (err) {
+    console.log("[DiscordRenewed] setLoginItemSettings error:", err && err.message);
+  }
+}
+
+ipcMain.on("dr:apply-login-settings", () => applyLoginItemSettings(readSettings()));
 
 // Open the native file picker, COPY the chosen image or video into the app data
 // folder, record it, and return it as a { type, url } resource the page can use
@@ -550,6 +572,32 @@ ipcMain.on("dr:set-badge", (_e, count) => {
   try { app.setBadgeCount(typeof count === "number" ? count : 0); } catch {}
 });
 
+// Web-mode taskbar unread badge + flash. The preload reads Discord's unread count
+// from the window title and hands us a pre-drawn PNG badge. We show it as a
+// Windows taskbar overlay icon, flash the taskbar on a NEW ping while unfocused,
+// and reflect the count in the tray tooltip.
+let lastUnreadCount = 0;
+ipcMain.on("dr:set-unread", (e, data) => {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  if (!win) return;
+  const count = data && typeof data.count === "number" ? data.count : 0;
+  try {
+    if (process.platform === "win32" || process.platform === "linux") {
+      if (count > 0 && data.badge) {
+        win.setOverlayIcon(nativeImage.createFromDataURL(data.badge), `${count} unread`);
+      } else {
+        win.setOverlayIcon(null, "");
+      }
+    }
+    if (count > lastUnreadCount && !win.isFocused()) win.flashFrame(true);
+    if (count === 0) win.flashFrame(false);
+    lastUnreadCount = count;
+    if (trayRef) trayRef.setToolTip(count > 0 ? `Discord Renewed — ${count} unread` : "Discord Renewed");
+  } catch (err) {
+    console.log("[DiscordRenewed] set-unread error:", err && err.message);
+  }
+});
+
 ipcMain.on("dr:set-zoom", (e, percent) => {
   // Discord restores its saved zoom via DiscordNative.window.setZoomFactor, and it
   // passes a PERCENTAGE (100 = 100%), whereas Electron's setZoomFactor wants a
@@ -611,9 +659,14 @@ app.on("before-quit", () => {
   isQuitting = true;
 });
 
+let trayRef = null; // held so the unread handler can update the tray tooltip
 function setupTray(win) {
   const tray = new Tray(nativeImage.createFromPath(ICON_PATH));
+  trayRef = tray;
   tray.setToolTip("Discord Renewed");
+
+  // Stop the taskbar flashing as soon as Bailey looks at the window.
+  win.on("focus", () => { try { win.flashFrame(false); } catch {} });
 
   const showWindow = () => {
     if (win.isMinimized()) win.restore();
@@ -799,7 +852,10 @@ if (!gotLock) {
 
     stripContentSecurityPolicy();
     setupScreenShareHandler();
-    const win = createWindow();
+    const bootSettings = readSettings();
+    applyLoginItemSettings(bootSettings); // keep the OS startup registration in sync
+    const startHidden = Boolean(bootSettings.startMinimized) || process.argv.includes("--start-minimized");
+    const win = createWindow(startHidden);
     setupTray(win);
     setupRichPresence(win);
 
