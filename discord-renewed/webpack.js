@@ -25,6 +25,40 @@
     } catch {}
   };
 
+  // Electron can't cleanly signal "user cancelled the screen-share picker" — a
+  // cancel comes back to getDisplayMedia() as AbortError "Invalid capture
+  // constraints", which Discord treats as a real failure (error toast). Wrap
+  // getDisplayMedia to translate that into the standard NotAllowedError that
+  // Discord's web code (like any browser) already handles as a silent cancel.
+  // (Electron issues #47980 / #45517.) Runs in Discord's own context before its
+  // bundle, so Discord uses the wrapped version.
+  try {
+    const md = navigator.mediaDevices;
+    if (md && typeof md.getDisplayMedia === "function" && !md.__drDisplayWrapped) {
+      const orig = md.getDisplayMedia.bind(md);
+      md.getDisplayMedia = function (...args) {
+        return orig(...args).catch((err) => {
+          if (err && err.name === "AbortError") {
+            throw new DOMException("Permission denied", "NotAllowedError");
+          }
+          throw err;
+        });
+      };
+      md.__drDisplayWrapped = true;
+    }
+  } catch {}
+
+  // Discord's web code leaves the screen-share getDisplayMedia rejection unhandled
+  // in our Electron shell (a cancel or a benign capture-constraint failure), which
+  // surfaces as an error. Swallow those specific unhandled rejections so cancelling
+  // the picker is silent, like it is in a real browser.
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e && e.reason;
+    if (r && (r.name === "NotAllowedError" || r.name === "AbortError" || r.name === "OverconstrainedError")) {
+      e.preventDefault();
+    }
+  });
+
   if (window.__drWebpack) {
     log("already initialised, skipping");
     return;
@@ -439,6 +473,7 @@
       try {
         if (e && e.quality) {
           const { res, fps } = currentTargets();
+          log("stream APPLIED setGoLiveSource → " + res + "p " + fps + "fps (was " + (e.quality.resolution) + "p " + (e.quality.frameRate) + "fps)");
           e = Object.assign({}, e, { quality: Object.assign({}, e.quality, { resolution: res, frameRate: fps }) });
         }
       } catch (err) {
@@ -461,6 +496,7 @@
       try {
         const { res, fps, bitrate } = currentTargets();
         const width = Math.round((res * 16) / 9);
+        log("stream APPLIED goLiveQuality → " + width + "x" + res + " " + fps + "fps @ " + (bitrate / 1e6).toFixed(1) + "Mbps");
         e = Object.assign({}, e, {
           bitrateMin: Math.round(bitrate * 0.6),
           bitrateMax: bitrate,

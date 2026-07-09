@@ -438,8 +438,8 @@ const SCHEMA = [
     id: "streamFps",
     type: "select",
     label: "Frame rate",
-    choices: ["30", "60"],
-    labels: { "30": "30 fps", "60": "60 fps" },
+    choices: ["15", "30", "60"],
+    labels: { "15": "15 fps", "30": "30 fps", "60": "60 fps" },
     def: "60",
   },
   {
@@ -1253,11 +1253,50 @@ function titlebarCss() {
 // ---------------------------------------------------------------------------
 
 const PICKER_ID = "dr-source-picker";
+const STREAM_MENU_ID = "dr-stream-menu";
+const STREAM_SUBMENU_ID = "dr-stream-submenu";
 
 function closeSourcePicker(choice) {
+  document.getElementById(STREAM_SUBMENU_ID)?.remove();
+  document.getElementById(STREAM_MENU_ID)?.remove();
   document.getElementById(PICKER_ID)?.remove();
   ipcRenderer.send("dr:capture-source-chosen", choice || { id: null });
 }
+
+// Stream quality options. These drive the SAME settings the stream-unlock reads
+// (see currentStreamConfig), so choosing quality here actually raises what gets
+// delivered — the picker and the unlock are one system now.
+const STREAM_RES_OPTS = [
+  { label: "720p", value: "720" },
+  { label: "1080p", value: "1080" },
+  { label: "1440p", value: "1440" },
+  { label: "Source", value: "auto" },
+];
+const STREAM_FPS_OPTS = [
+  { label: "15 FPS", value: "15" },
+  { label: "30 FPS", value: "30" },
+  { label: "60 FPS", value: "60" },
+];
+function pickerResText() {
+  const rs = val("streamRes");
+  if (!rs || rs === "auto") return ((displaySize && displaySize.height) || 1440) + "p";
+  return rs + "p";
+}
+function pickerFpsText() {
+  return (Number(val("streamFps")) || 60) + "fps";
+}
+function pickerModeName() {
+  const m = val("streamMode") || "custom";
+  return m === "gaming" ? "Gaming" : m === "screenshare" ? "Screenshare" : "Custom";
+}
+
+const PICKER_ICONS = {
+  apps: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M5 3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h6v2H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2h6a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2H5Zm0 2h14v10H5V5Z"/></svg>',
+  screen: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M4 4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h6v1H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-2v-1h6a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1H4Z"/></svg>',
+  gear: '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M14.6 3.2a1 1 0 0 0-1-.8h-3.2a1 1 0 0 0-1 .8l-.3 1.7a7.5 7.5 0 0 0-1.6.9l-1.6-.6a1 1 0 0 0-1.2.4L2.5 8.4a1 1 0 0 0 .2 1.3l1.3 1.1a7.6 7.6 0 0 0 0 1.8l-1.3 1.1a1 1 0 0 0-.2 1.3l1.6 2.8a1 1 0 0 0 1.2.4l1.6-.6c.5.4 1 .7 1.6.9l.3 1.7a1 1 0 0 0 1 .8h3.2a1 1 0 0 0 1-.8l.3-1.7c.6-.2 1.1-.5 1.6-.9l1.6.6a1 1 0 0 0 1.2-.4l1.6-2.8a1 1 0 0 0-.2-1.3l-1.3-1.1a7.6 7.6 0 0 0 0-1.8l1.3-1.1a1 1 0 0 0 .2-1.3l-1.6-2.8a1 1 0 0 0-1.2-.4l-1.6.6a7.5 7.5 0 0 0-1.6-.9l-.3-1.7ZM12 15a3 3 0 1 1 0-6 3 3 0 0 1 0 6Z"/></svg>',
+  chevron: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>',
+  check: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg>',
+};
 
 function showSourcePicker(sources) {
   document.getElementById(PICKER_ID)?.remove();
@@ -1265,135 +1304,259 @@ function showSourcePicker(sources) {
   const overlay = document.createElement("div");
   overlay.id = PICKER_ID;
   Object.assign(overlay.style, {
-    position: "fixed",
-    inset: "0",
-    zIndex: "200000",
-    background: "rgba(0,0,0,0.6)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
+    position: "fixed", inset: "0", zIndex: "200000",
+    background: "rgba(0,0,0,0.75)", display: "flex",
+    alignItems: "center", justifyContent: "center",
+    fontFamily: "var(--font-primary, 'gg sans', sans-serif)",
   });
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) closeSourcePicker(null); // click outside = cancel
-  });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeSourcePicker(null); });
 
   const card = document.createElement("div");
   Object.assign(card.style, {
-    width: "min(680px, 90vw)",
-    maxHeight: "80vh",
-    display: "flex",
-    flexDirection: "column",
-    background: "#2b2d31",
-    border: "1px solid rgba(255,255,255,0.08)",
-    borderRadius: "12px",
-    boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
-    color: "var(--text-normal, #dbdee1)",
-    overflow: "hidden",
+    width: "min(840px, 92vw)", maxHeight: "86vh",
+    display: "flex", flexDirection: "column",
+    background: "#232428", borderRadius: "8px",
+    boxShadow: "0 8px 32px rgba(0,0,0,0.6)", color: "#f2f3f5", overflow: "hidden",
   });
 
-  const header = document.createElement("div");
-  Object.assign(header.style, { padding: "20px 24px 4px", fontSize: "18px", fontWeight: "700" });
-  header.textContent = "What do you want to share?";
-  card.appendChild(header);
+  // --- Tabs: Applications | Entire Screen (Devices intentionally skipped) ---
+  const tabBar = document.createElement("div");
+  Object.assign(tabBar.style, { display: "flex", gap: "4px", padding: "8px", borderBottom: "1px solid rgba(0,0,0,0.3)" });
+  let activeTab = "apps";
+  const tabs = [
+    { id: "apps", label: "Applications", icon: PICKER_ICONS.apps },
+    { id: "screen", label: "Entire Screen", icon: PICKER_ICONS.screen },
+  ];
+  const tabEls = {};
+  for (const t of tabs) {
+    const b = document.createElement("button");
+    b.innerHTML = t.icon + `<span style="margin-left:8px">${t.label}</span>`;
+    Object.assign(b.style, {
+      flex: "1", display: "flex", alignItems: "center", justifyContent: "center",
+      padding: "10px", borderRadius: "8px", border: "none", cursor: "pointer",
+      background: "transparent", color: "#b5bac1", fontSize: "15px", fontWeight: "500",
+    });
+    b.addEventListener("click", () => { activeTab = t.id; renderTabs(); renderGrid(); });
+    tabEls[t.id] = b;
+    tabBar.appendChild(b);
+  }
+  function renderTabs() {
+    for (const t of tabs) {
+      const on = t.id === activeTab;
+      Object.assign(tabEls[t.id].style, { background: on ? "#3f4248" : "transparent", color: on ? "#ffffff" : "#b5bac1" });
+    }
+  }
+  card.appendChild(tabBar);
 
+  // --- Source grid (filtered by tab) ---
   const grid = document.createElement("div");
-  Object.assign(grid.style, {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
-    gap: "12px",
-    padding: "16px 24px",
-    overflowY: "auto",
-  });
+  Object.assign(grid.style, { display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", padding: "16px", overflowY: "auto" });
+  function renderGrid() {
+    grid.innerHTML = "";
+    const list = sources.filter((s) => s.isScreen === (activeTab === "screen"));
+    if (!list.length) {
+      const empty = document.createElement("div");
+      empty.textContent = activeTab === "screen" ? "No screens found." : "No application windows found.";
+      Object.assign(empty.style, { gridColumn: "1 / -1", textAlign: "center", padding: "40px", color: "#949ba4" });
+      grid.appendChild(empty);
+      return;
+    }
+    for (const src of list) {
+      const tile = document.createElement("button");
+      Object.assign(tile.style, {
+        display: "flex", flexDirection: "column", gap: "8px", padding: "8px",
+        background: "transparent", border: "1px solid transparent", borderRadius: "8px",
+        cursor: "pointer", color: "inherit", textAlign: "left", minWidth: "0",
+      });
+      tile.addEventListener("mouseenter", () => { tile.style.background = "rgba(255,255,255,0.04)"; tile.style.borderColor = "rgba(255,255,255,0.08)"; });
+      tile.addEventListener("mouseleave", () => { tile.style.background = "transparent"; tile.style.borderColor = "transparent"; });
 
-  let selectedId = null;
-  const tiles = [];
+      const img = document.createElement("img");
+      img.src = src.thumbnail;
+      Object.assign(img.style, { width: "100%", aspectRatio: "16 / 9", objectFit: "cover", background: "#1a1b1e", borderRadius: "6px" });
 
-  // Screens first (they can carry "Share audio"), then windows.
-  const ordered = [...sources].sort((a, b) => (a.isScreen === b.isScreen ? 0 : a.isScreen ? -1 : 1));
+      const nameRow = document.createElement("div");
+      Object.assign(nameRow.style, { display: "flex", alignItems: "center", gap: "8px", minWidth: "0" });
+      if (src.appIcon) {
+        const ic = document.createElement("img");
+        ic.src = src.appIcon;
+        Object.assign(ic.style, { width: "16px", height: "16px", flex: "0 0 auto" });
+        nameRow.appendChild(ic);
+      }
+      const label = document.createElement("span");
+      label.textContent = src.name || (src.isScreen ? "Screen" : "Window");
+      Object.assign(label.style, { fontSize: "14px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" });
+      nameRow.appendChild(label);
 
-  for (const src of ordered) {
-    const tile = document.createElement("button");
-    tile.dataset.id = src.id;
-    Object.assign(tile.style, {
-      display: "flex",
-      flexDirection: "column",
-      alignItems: "stretch",
-      gap: "6px",
-      padding: "8px",
-      background: "rgba(0,0,0,0.2)",
-      border: "2px solid transparent",
-      borderRadius: "8px",
-      cursor: "pointer",
-      color: "inherit",
-      textAlign: "left",
-    });
-
-    const img = document.createElement("img");
-    img.src = src.thumbnail;
-    Object.assign(img.style, {
-      width: "100%",
-      height: "100px",
-      objectFit: "contain",
-      background: "#1e1f22",
-      borderRadius: "4px",
-    });
-
-    const label = document.createElement("div");
-    label.textContent = src.name || (src.isScreen ? "Screen" : "Window");
-    Object.assign(label.style, {
-      fontSize: "12px",
-      whiteSpace: "nowrap",
-      overflow: "hidden",
-      textOverflow: "ellipsis",
-    });
-
-    tile.append(img, label);
-    tile.addEventListener("click", () => {
-      selectedId = src.id;
-      tiles.forEach((t) => (t.style.borderColor = t.dataset.id === selectedId ? "#5865F2" : "transparent"));
-      audioRow.style.opacity = src.isScreen ? "1" : "0.4";
-      audioCheckbox.disabled = !src.isScreen;
-      if (!src.isScreen) audioCheckbox.checked = false;
-    });
-    tiles.push(tile);
-    grid.appendChild(tile);
+      tile.append(img, nameRow);
+      tile.addEventListener("click", () => closeSourcePicker({ id: src.id, muteAudio: Boolean(val("muteStreamAudio")) }));
+      grid.appendChild(tile);
+    }
   }
   card.appendChild(grid);
 
-  // "Share audio" — only meaningful for a full screen (matches Discord's own
-  // picker; per-window system-audio loopback isn't reliably supported).
-  const audioRow = document.createElement("label");
-  Object.assign(audioRow.style, {
-    display: "flex",
-    alignItems: "center",
-    gap: "10px",
-    padding: "4px 24px 4px",
-    fontSize: "14px",
-    opacity: "0.4",
-    cursor: "pointer",
-  });
-  const audioCheckbox = document.createElement("input");
-  audioCheckbox.type = "checkbox";
-  audioCheckbox.disabled = true;
-  const audioText = document.createElement("span");
-  audioText.textContent = "Share audio";
-  audioRow.append(audioCheckbox, audioText);
-  card.appendChild(audioRow);
-
-  const footer = document.createElement("div");
-  Object.assign(footer.style, { display: "flex", justifyContent: "flex-end", gap: "10px", padding: "16px 24px 20px" });
-  const cancel = makeButton("Cancel", "#4e5058");
-  cancel.addEventListener("click", () => closeSourcePicker(null));
-  const share = makeButton("Share", "#5865F2");
-  share.addEventListener("click", () => {
-    if (!selectedId) return;
-    closeSourcePicker({ id: selectedId, withAudio: audioCheckbox.checked });
-  });
-  footer.append(cancel, share);
-  card.appendChild(footer);
+  // --- Bottom bar: quality summary (left) + gear (right) ---
+  const bar = document.createElement("div");
+  Object.assign(bar.style, { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px", borderTop: "1px solid rgba(0,0,0,0.3)" });
+  const qualityBox = document.createElement("div");
+  const modeLine = document.createElement("div");
+  Object.assign(modeLine.style, { fontSize: "15px", fontWeight: "700" });
+  const detailLine = document.createElement("div");
+  Object.assign(detailLine.style, { fontSize: "12px", color: "#949ba4", marginTop: "2px" });
+  qualityBox.append(modeLine, detailLine);
+  function refreshQuality() {
+    modeLine.textContent = pickerModeName();
+    detailLine.textContent = pickerResText() + " · " + pickerFpsText();
+  }
+  const gearBtn = document.createElement("button");
+  gearBtn.innerHTML = PICKER_ICONS.gear;
+  Object.assign(gearBtn.style, { width: "40px", height: "40px", borderRadius: "50%", border: "none", cursor: "pointer", background: "#2b2d31", color: "#dbdee1", display: "flex", alignItems: "center", justifyContent: "center", flex: "0 0 auto" });
+  gearBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleStreamMenu(gearBtn, refreshQuality); });
+  bar.append(qualityBox, gearBtn);
+  card.appendChild(bar);
 
   overlay.appendChild(card);
   document.documentElement.appendChild(overlay);
+  renderTabs();
+  renderGrid();
+  refreshQuality();
+}
+
+// The gear's "Stream Mode" context menu — Discord-styled. Drives the persisted
+// stream settings (streamMode / streamRes / streamFps / muteStreamAudio), which
+// the stream-unlock reads, so changing quality here applies to the next stream.
+function toggleStreamMenu(gearBtn, onChange) {
+  if (document.getElementById(STREAM_MENU_ID)) { closeStreamMenu(); return; }
+
+  const menu = document.createElement("div");
+  menu.id = STREAM_MENU_ID;
+  Object.assign(menu.style, {
+    position: "fixed", zIndex: "200001", minWidth: "244px",
+    background: "#111214", borderRadius: "4px", padding: "6px 8px",
+    boxShadow: "0 8px 16px rgba(0,0,0,0.24)", color: "#dbdee1",
+    fontFamily: "var(--font-primary, 'gg sans', sans-serif)", fontSize: "14px",
+  });
+
+  const mkRow = () => {
+    const r = document.createElement("div");
+    Object.assign(r.style, { display: "flex", alignItems: "center", gap: "8px", padding: "8px", borderRadius: "4px", cursor: "pointer" });
+    r.addEventListener("mouseenter", () => (r.style.background = "#4752c4"));
+    r.addEventListener("mouseleave", () => (r.style.background = "transparent"));
+    return r;
+  };
+  const mkSection = (text) => {
+    const d = document.createElement("div");
+    d.textContent = text;
+    Object.assign(d.style, { fontSize: "11px", fontWeight: "700", color: "#949ba4", padding: "8px 8px 4px", letterSpacing: "0.02em" });
+    return d;
+  };
+  const mkDivider = () => {
+    const d = document.createElement("div");
+    Object.assign(d.style, { height: "1px", background: "rgba(255,255,255,0.06)", margin: "6px 4px" });
+    return d;
+  };
+  const rebuild = () => { document.getElementById(STREAM_SUBMENU_ID)?.remove(); menu.innerHTML = ""; build(); if (onChange) onChange(); };
+
+  function radioItem(title, subtitle, selected, onClick) {
+    const r = mkRow();
+    const txt = document.createElement("div"); txt.style.flex = "1"; txt.style.minWidth = "0";
+    const t = document.createElement("div"); t.textContent = title; t.style.fontWeight = "600"; txt.appendChild(t);
+    if (subtitle) { const s = document.createElement("div"); s.textContent = subtitle; Object.assign(s.style, { fontSize: "12px", color: "#b5bac1" }); txt.appendChild(s); }
+    const radio = document.createElement("div");
+    Object.assign(radio.style, { width: "20px", height: "20px", borderRadius: "50%", boxSizing: "border-box", flex: "0 0 auto", border: selected ? "6px solid #5865f2" : "2px solid #80848e" });
+    r.append(txt, radio);
+    r.addEventListener("click", () => { onClick(); rebuild(); });
+    return r;
+  }
+  function submenuItem(title, opts, currentValue, onPick) {
+    const r = mkRow();
+    const t = document.createElement("div"); t.textContent = title; t.style.flex = "1"; t.style.fontWeight = "500";
+    const chev = document.createElement("div"); chev.innerHTML = PICKER_ICONS.chevron; chev.style.color = "#b5bac1";
+    r.append(t, chev);
+    r.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openStreamSubMenu(r.getBoundingClientRect(), opts, currentValue, (v) => { onPick(v); rebuild(); });
+    });
+    return r;
+  }
+  function checkItem(title, checked, onToggle) {
+    const r = mkRow();
+    const t = document.createElement("div"); t.textContent = title; t.style.flex = "1"; t.style.fontWeight = "500";
+    const box = document.createElement("div");
+    Object.assign(box.style, { width: "20px", height: "20px", borderRadius: "6px", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", flex: "0 0 auto", border: checked ? "none" : "2px solid #80848e", background: checked ? "#5865f2" : "transparent" });
+    if (checked) box.innerHTML = PICKER_ICONS.check;
+    r.append(t, box);
+    r.addEventListener("click", () => { onToggle(); rebuild(); });
+    return r;
+  }
+
+  function build() {
+    const mode = val("streamMode") || "custom";
+    menu.appendChild(mkSection("STREAM MODE"));
+    menu.appendChild(radioItem("Gaming", "Smoother video (Source, 60fps)", mode === "gaming", () => {
+      setSetting("streamMode", "gaming"); setSetting("streamRes", "auto"); setSetting("streamFps", "60");
+    }));
+    menu.appendChild(radioItem("Screenshare", "Clearer text (Source, 15fps)", mode === "screenshare", () => {
+      setSetting("streamMode", "screenshare"); setSetting("streamRes", "auto"); setSetting("streamFps", "15");
+    }));
+    menu.appendChild(radioItem("Custom", "", mode === "custom", () => setSetting("streamMode", "custom")));
+    menu.appendChild(mkDivider());
+    menu.appendChild(submenuItem("Screen Resolution", STREAM_RES_OPTS, val("streamRes") || "auto", (v) => { setSetting("streamRes", v); setSetting("streamMode", "custom"); }));
+    menu.appendChild(submenuItem("Frame Rate", STREAM_FPS_OPTS, String(val("streamFps") || "60"), (v) => { setSetting("streamFps", v); setSetting("streamMode", "custom"); }));
+    menu.appendChild(mkDivider());
+    menu.appendChild(checkItem("Mute stream audio", Boolean(val("muteStreamAudio")), () => setSetting("muteStreamAudio", !val("muteStreamAudio"))));
+  }
+  build();
+
+  document.documentElement.appendChild(menu);
+  const gr = gearBtn.getBoundingClientRect();
+  const mr = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, gr.right - mr.width) + "px";
+  menu.style.top = Math.max(8, gr.top - mr.height - 8) + "px";
+
+  setTimeout(() => {
+    const off = (e) => {
+      if (menu.contains(e.target) || e.target === gearBtn || document.getElementById(STREAM_SUBMENU_ID)?.contains(e.target)) return;
+      closeStreamMenu();
+      document.removeEventListener("mousedown", off);
+    };
+    menu._off = off;
+    document.addEventListener("mousedown", off);
+  }, 0);
+}
+
+function closeStreamMenu() {
+  document.getElementById(STREAM_SUBMENU_ID)?.remove();
+  const m = document.getElementById(STREAM_MENU_ID);
+  if (m && m._off) document.removeEventListener("mousedown", m._off);
+  m?.remove();
+}
+
+// A flyout submenu (Screen Resolution / Frame Rate) opened to the left of a row.
+function openStreamSubMenu(anchorRect, opts, currentValue, onPick) {
+  document.getElementById(STREAM_SUBMENU_ID)?.remove();
+  const sub = document.createElement("div");
+  sub.id = STREAM_SUBMENU_ID;
+  Object.assign(sub.style, {
+    position: "fixed", zIndex: "200002", minWidth: "150px",
+    background: "#111214", borderRadius: "4px", padding: "6px 8px",
+    boxShadow: "0 8px 16px rgba(0,0,0,0.24)", color: "#dbdee1",
+    fontFamily: "var(--font-primary, 'gg sans', sans-serif)", fontSize: "14px",
+  });
+  for (const o of opts) {
+    const r = document.createElement("div");
+    Object.assign(r.style, { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", padding: "8px", borderRadius: "4px", cursor: "pointer" });
+    r.addEventListener("mouseenter", () => (r.style.background = "#4752c4"));
+    r.addEventListener("mouseleave", () => (r.style.background = "transparent"));
+    const t = document.createElement("span"); t.textContent = o.label; r.appendChild(t);
+    if (String(o.value) === String(currentValue)) { const c = document.createElement("span"); c.innerHTML = PICKER_ICONS.check; r.appendChild(c); }
+    r.addEventListener("click", (e) => { e.stopPropagation(); onPick(o.value); });
+    sub.appendChild(r);
+  }
+  document.documentElement.appendChild(sub);
+  const sr = sub.getBoundingClientRect();
+  sub.style.left = Math.max(8, anchorRect.left - sr.width - 4) + "px";
+  sub.style.top = Math.max(8, Math.min(anchorRect.top - 6, window.innerHeight - sr.height - 8)) + "px";
 }
 
 ipcRenderer.on("dr:show-source-picker", (_event, sources) => showSourcePicker(sources));

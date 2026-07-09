@@ -815,9 +815,10 @@ function setupRichPresence(win) {
 
 let pendingCaptureCallback = null;
 let pendingCaptureSources = [];
+let pendingAudioRequested = false;
 
 function setupScreenShareHandler() {
-  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
     if (pendingCaptureCallback) {
       pendingCaptureCallback({}); // a stale request was still open — cancel it
       pendingCaptureCallback = null;
@@ -830,9 +831,18 @@ function setupScreenShareHandler() {
       });
       pendingCaptureSources = sources;
       pendingCaptureCallback = callback;
+      // Only offer audio if Discord's request actually asked for it — attaching an
+      // unrequested audio track is what throws "Invalid capture constraints".
+      pendingAudioRequested = request.audioRequested === true;
       win?.webContents.send(
         "dr:show-source-picker",
-        sources.map((s) => ({ id: s.id, name: s.name, isScreen: s.id.startsWith("screen:"), thumbnail: s.thumbnail.toDataURL() }))
+        sources.map((s) => ({
+          id: s.id,
+          name: s.name,
+          isScreen: s.id.startsWith("screen:"),
+          thumbnail: s.thumbnail.toDataURL(),
+          appIcon: s.appIcon && !s.appIcon.isEmpty() ? s.appIcon.toDataURL() : null,
+        }))
       );
     } catch (err) {
       console.error("[DiscordRenewed] desktopCapturer.getSources failed:", err.message);
@@ -841,11 +851,12 @@ function setupScreenShareHandler() {
   });
 }
 
-// The renderer's answer to the picker: { id, withAudio } for a choice, or
-// { id: null } to cancel. "loopback" system-audio capture is confirmed stable
-// on Windows (the Electron bug where it silently returns silence is macOS-only
-// — issue #49607) so it's only offered for full-screen sources, matching
-// Discord's own official picker (per-window audio loopback isn't reliable).
+// The renderer's answer to the picker: { id, muteAudio } for a choice, or
+// { id: null } to cancel. We mirror Discord's model — stream audio is shared BY
+// DEFAULT and "Mute stream audio" turns it off. "loopback" = system audio, which
+// is stable on Windows (the Electron silent-loopback bug is macOS-only, #49607).
+// The audio key is only INCLUDED when unmuted — passing audio:undefined made
+// Electron's handler error (that was the "errors when audio unchecked" bug).
 function handleCaptureChoice(_event, choice) {
   const cb = pendingCaptureCallback;
   pendingCaptureCallback = null;
@@ -853,10 +864,18 @@ function handleCaptureChoice(_event, choice) {
   const source = choice && choice.id ? pendingCaptureSources.find((s) => s.id === choice.id) : null;
   pendingCaptureSources = [];
   if (!source) {
-    cb({}); // cancelled, or the chosen id vanished (window closed mid-pick)
+    // Cancelled (or the chosen id vanished). Electron has no clean "deny" API —
+    // calling back with no video after a video request throws "Video was requested,
+    // but no video stream was provided" (electron #47980). Swallow it; the page's
+    // getDisplayMedia still rejects (handled by the wrapper + unhandledrejection
+    // suppressor in webpack.js), so the cancel is silent end-to-end.
+    try { cb({}); } catch (err) { console.log("[DiscordRenewed] screen-share cancelled:", err && err.message); }
     return;
   }
-  cb({ video: source, audio: choice.withAudio ? "loopback" : undefined });
+  const result = { video: source };
+  // Attach system audio only when Discord asked for it AND the user didn't mute.
+  if (pendingAudioRequested && !choice.muteAudio) result.audio = "loopback";
+  cb(result);
 }
 
 // If the user turned on "Low memory mode", apply memory-saving Chromium
