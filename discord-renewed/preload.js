@@ -442,17 +442,6 @@ const SCHEMA = [
     labels: { "15": "15 fps", "30": "30 fps", "60": "60 fps" },
     def: "60",
   },
-  {
-    section: "Streaming",
-    id: "streamBitrate",
-    type: "slider",
-    label: "Bitrate ceiling",
-    min: 2000,
-    max: 10000,
-    step: 500,
-    def: 8000,
-    suffix: " kbps",
-  },
   { section: "Streaming", id: "streamStatus", type: "streamStatus", label: "Patch status" },
   { section: "Streaming", id: "streamReload", type: "button", label: "Reload Discord (apply / fully remove changes)", action: "reload" },
 ];
@@ -1277,6 +1266,13 @@ const STREAM_FPS_OPTS = [
   { label: "30 FPS", value: "30" },
   { label: "60 FPS", value: "60" },
 ];
+// Bitrate lives under the gear's "Advanced" submenu (values in kbps, shown Mbps).
+const STREAM_BITRATE_OPTS = [
+  { label: "2.5 Mbps", value: 2500 },
+  { label: "5 Mbps", value: 5000 },
+  { label: "8 Mbps", value: 8000 },
+  { label: "10 Mbps", value: 10000 },
+];
 function pickerResText() {
   const rs = val("streamRes");
   if (!rs || rs === "auto") return ((displaySize && displaySize.height) || 1440) + "p";
@@ -1468,14 +1464,14 @@ function toggleStreamMenu(gearBtn, onChange) {
     r.addEventListener("click", () => { onClick(); rebuild(); });
     return r;
   }
-  function submenuItem(title, opts, currentValue, onPick) {
+  function submenuItem(title, opts, currentValue, onPick, flyoutTitle) {
     const r = mkRow();
     const t = document.createElement("div"); t.textContent = title; t.style.flex = "1"; t.style.fontWeight = "500";
     const chev = document.createElement("div"); chev.innerHTML = PICKER_ICONS.chevron; chev.style.color = "#b5bac1";
     r.append(t, chev);
     r.addEventListener("click", (e) => {
       e.stopPropagation();
-      openStreamSubMenu(r.getBoundingClientRect(), opts, currentValue, (v) => { onPick(v); rebuild(); });
+      openStreamSubMenu(r.getBoundingClientRect(), opts, currentValue, (v) => { onPick(v); rebuild(); }, flyoutTitle);
     });
     return r;
   }
@@ -1505,6 +1501,7 @@ function toggleStreamMenu(gearBtn, onChange) {
     menu.appendChild(submenuItem("Frame Rate", STREAM_FPS_OPTS, String(val("streamFps") || "60"), (v) => { setSetting("streamFps", v); setSetting("streamMode", "custom"); }));
     menu.appendChild(mkDivider());
     menu.appendChild(checkItem("Mute stream audio", Boolean(val("muteStreamAudio")), () => setSetting("muteStreamAudio", !val("muteStreamAudio"))));
+    menu.appendChild(submenuItem("Advanced", STREAM_BITRATE_OPTS, val("streamBitrate") || 8000, (v) => setSetting("streamBitrate", v), "Bitrate"));
   }
   build();
 
@@ -1532,8 +1529,9 @@ function closeStreamMenu() {
   m?.remove();
 }
 
-// A flyout submenu (Screen Resolution / Frame Rate) opened to the left of a row.
-function openStreamSubMenu(anchorRect, opts, currentValue, onPick) {
+// A flyout submenu (Screen Resolution / Frame Rate / Advanced) opened to the left
+// of a row. `title` renders an optional section header (used for Advanced→Bitrate).
+function openStreamSubMenu(anchorRect, opts, currentValue, onPick, title) {
   document.getElementById(STREAM_SUBMENU_ID)?.remove();
   const sub = document.createElement("div");
   sub.id = STREAM_SUBMENU_ID;
@@ -1543,6 +1541,12 @@ function openStreamSubMenu(anchorRect, opts, currentValue, onPick) {
     boxShadow: "0 8px 16px rgba(0,0,0,0.24)", color: "#dbdee1",
     fontFamily: "var(--font-primary, 'gg sans', sans-serif)", fontSize: "14px",
   });
+  if (title) {
+    const h = document.createElement("div");
+    h.textContent = title;
+    Object.assign(h.style, { fontSize: "11px", fontWeight: "700", color: "#949ba4", padding: "8px 8px 4px", letterSpacing: "0.02em" });
+    sub.appendChild(h);
+  }
   for (const o of opts) {
     const r = document.createElement("div");
     Object.assign(r.style, { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", padding: "8px", borderRadius: "4px", cursor: "pointer" });
