@@ -31,6 +31,123 @@
   }
 
   // -------------------------------------------------------------------------
+  // FACTORY PATCHING (pre-execution source rewrites).
+  //
+  // Unlike the stream-unlock feature (which wraps class methods at RUNTIME on
+  // already-instantiated modules), some fixes must change a module's SOURCE
+  // before Discord ever runs it — because the value is a closure local behind a
+  // non-configurable getter that can't be reassigned afterwards. We do this the
+  // Vencord way: hook `webpackChunkdiscord_app.push` so we see every chunk's
+  // module factories the instant they arrive (before webpack executes them),
+  // string-replace the target factory's source, and recompile it. Discord's
+  // bundle is loaded AFTER this script, so the push hook is in place in time.
+  //
+  // Modules are recompiled by wrapping the factory's own `id(e,t,n){...}`
+  // method-shorthand source in an object literal and eval'ing it (main.js strips
+  // Discord's CSP, so eval is allowed). Every step is guarded — if a patch
+  // fails to match or recompile, the ORIGINAL factory is kept untouched, so a
+  // future Discord build that renames things simply leaves the feature inert
+  // rather than breaking the client.
+  //
+  // GATED to the desktop spoof only (DiscordNative present): these patches are
+  // meaningless/unwanted on the normal web client.
+  // -------------------------------------------------------------------------
+
+  const SPOOF = window.DiscordNative != null; // nativebridge injects before us when the spoof is on
+
+  // Each patch: `find` (optional substring that scopes the patch to one module —
+  // omit to match purely by the edit regexes) and `edits` (list of {re, replace}
+  // applied to that module's source), applied at most once.
+  //
+  // platform-embedded-off: force isPlatformEmbedded=false GLOBALLY (module 574381,
+  // `let s=window.DiscordNative,a=null!=s,o=null!=s?s.process.platform:""` → a=!1)
+  // so the media engine goes browser + no "corrupt installation" banner + the
+  // spoofed client stays stable, while isDesktop (from `o`) stays true → desktop
+  // UI/title bar/features intact. NOTE (2026-07-07): this does NOT make voice
+  // CALLS connect under the spoof — the voice transport's web-vs-native behavior
+  // is spread across ~17 media/voice modules' platform-flag reads (esp. isWindows),
+  // several shared with non-voice code, so a clean voice-only patch isn't viable;
+  // voice under the spoof needs a different approach (see memory). Keep the spoof
+  // OFF for making calls until that's solved.
+  const FACTORY_PATCHES = [
+    {
+      id: "platform-embedded-off",
+      edits: [{
+        re: /(let (\w+)=window\.DiscordNative,)(\w+)(=null!=\2,)(\w+)(=null!=\2\?\2\.process\.platform)/,
+        replace: "$1$3=!1,$5$6",
+      }],
+      done: false,
+    },
+  ];
+
+  function recompileFactory(id, src) {
+    // Factory source is method-shorthand `123(e,t,n){...}`; a numeric method key
+    // is valid in an object literal, so wrap + eval + pull it back out.
+    const obj = (0, eval)("({" + src + "})");
+    const fn = obj[id];
+    if (typeof fn !== "function") throw new Error("recompiled key missing");
+    return fn;
+  }
+
+  function patchModuleFactories(modules) {
+    if (!SPOOF) return;
+    if (FACTORY_PATCHES.every((p) => p.done)) return; // nothing left to look for
+    for (const id in modules) {
+      const factory = modules[id];
+      if (typeof factory !== "function") continue;
+      let src;
+      try { src = Function.prototype.toString.call(factory); } catch { continue; }
+      let patched = src;
+      for (const p of FACTORY_PATCHES) {
+        if (p.done) continue;
+        if (p.find && !src.includes(p.find)) continue; // scope to the target module
+        let changed = false;
+        for (const e of p.edits) {
+          const next = patched.replace(e.re, e.replace);
+          if (next !== patched) { patched = next; changed = true; }
+        }
+        if (changed) { p.done = true; log("factory patch '" + p.id + "' applied to module " + id); }
+      }
+      if (patched === src) continue;
+      try {
+        modules[id] = recompileFactory(id, patched);
+        log("factory patch applied + recompiled module " + id);
+      } catch (e) {
+        log("factory recompile FAILED for module " + id + ": " + (e && e.message));
+      }
+    }
+  }
+
+  function installFactoryPatcher() {
+    if (!SPOOF || !FACTORY_PATCHES.length) return;
+    let store = window.webpackChunkdiscord_app;
+    const hookPush = (arr) => {
+      if (!arr || arr.__drPatched) return arr;
+      const origPush = arr.push.bind(arr);
+      arr.push = function (chunk) {
+        try { if (chunk && chunk[1]) patchModuleFactories(chunk[1]); } catch (e) { log("push-patch error: " + (e && e.message)); }
+        return origPush(chunk);
+      };
+      arr.__drPatched = true;
+      log("webpackChunkdiscord_app.push hooked for factory patching");
+      return arr;
+    };
+    if (store) hookPush(store); // already created (shouldn't be — we run first)
+    // Discord creates the chunk array after us; intercept its assignment.
+    try {
+      Object.defineProperty(window, "webpackChunkdiscord_app", {
+        configurable: true,
+        get() { return store; },
+        set(v) { store = hookPush(v); },
+      });
+    } catch (e) {
+      log("could not define webpackChunkdiscord_app hook: " + (e && e.message));
+    }
+  }
+
+  installFactoryPatcher();
+
+  // -------------------------------------------------------------------------
   // Capture Discord's MAIN webpack `require`.
   // Technique (from Vencord's patchWebpack): every webpack require is a function
   // that gets `require.m = moduleFactories` assigned while it's built, so a setter
@@ -98,6 +215,9 @@
           configurable: true,
           enumerable: true,
         });
+        // Eager modules (assigned directly to require.m, not via a lazy chunk
+        // push) also flow through here — patch them before webpack executes them.
+        try { patchModuleFactories(modules); } catch (e) { log("m-hook patch err: " + (e && e.message)); }
         consider(this);
       },
     });
